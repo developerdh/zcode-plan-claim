@@ -1,0 +1,21 @@
+{
+  "name": "zcode-plan-claim",
+  "version": "0.1.0",
+  "description": "非官方的 ZCode 活动套餐查询与领取 CLI（preview / current / claim）",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "zcode-claim": "skills/zcode-plan-claim/scripts/claim.mjs"
+  },
+  "scripts": {
+    "test": "node skills/zcode-plan-claim/tests/mock-claim-test.mjs && node skills/zcode-plan-claim/tests/captcha-inject-test.mjs"
+  },
+  "keywords": ["zcode", "zai", "glm", "agent-skills"],
+  "repository": {
+    "type": "git",
+    "url": ""
+  }
+}
