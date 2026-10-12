@@ -60,6 +60,7 @@ GET /api/v1/marketing/touch?seq=<递增整数>
 ```
 - 按钮动作类型：`claim_zcode_plan`（args.plan_id）/ `open_url` / `navigate`（应用内页面跳转）/ `close` / `copy_text`
 - `success_popup` 为活动方配置的"领取成功"弹窗内容
+- 2026-10-11 实测：账号领取套餐后，该账号的 `deliveries` 返回空数组（活动卡片不再下发）
 - 行为上报（非必须）：`POST /api/v1/marketing/touch/action`，body `{campaign_id, action_type:"confirm"|"cancel"}`
 
 ### 3.2 查询当前可领取套餐（推荐用这个判断"有没有活动"）
@@ -100,6 +101,26 @@ Body: {"plan_id":"<planId>"}
 
 成功 → { code:0, data:{ plan:{ user_plan_id, plan_id, status:"active", ... }, message:"Plan claimed successfully." } }
 ```
+
+### 3.6 本地状态与一站式 status（区分"无活动"与"已领取过"）
+
+`node claim.mjs status` = preview + current + marketing/touch 三个只读 GET 的合并视图，并把观测到的
+套餐并入本地状态文件 `~/.zcode/zcode-plan-claim-state.json`（`ZCODE_CLAIM_STATE_FILE` 可覆盖；只存
+套餐元数据，不含任何凭证）：
+
+- current 出现过 / claim 成功响应中的套餐 → 记 `claimedAt`（确证"已领取"），过期后仍保留
+- preview 出现过的未领套餐 → 仅记 sighting（`lastPreviewAt`）
+- 输出 `situation` 字段：
+
+| situation | 含义 | 处置 |
+|---|---|---|
+| `claimable` | 有未领套餐（`recommendedPlanId` 为 priority 最大者，并列取第一个） | 进入领取流程 |
+| `already_claimed_active` | 无未领套餐，但已领取套餐仍在生效 | 报告生效套餐详情，结束 |
+| `claimed_expired` | 无未领、无生效，但本地有领取记录 | 报告历史，结束 |
+| `none` | 三处均无记录 | 报告无活动，结束 |
+
+- 退出码：0=查询成功（分支看 situation），4=接口失败
+- 领取成功（claim code=0）也会把套餐写入状态文件，此后即使过期 status 仍能报告"领取过"
 
 ## 4. 验证码（阿里云 Captcha 2.0，每次领取都需要）
 
@@ -146,10 +167,15 @@ initAliyunCaptcha({
 6. 验证码参数一次性：同一个 param 发两次 claim，第二次 3007
 7. `client/configs` 以 GET 重放（含 `app_version`/`platform` 参数或 `X-Client-Language` 头的各种组合）均 3001；
    完整请求规格待新抓包确认，此前该接口只作诊断、不进主流程（2026-10-04 复测）
+8. 领取成功后 `preview` 返回空数组（只列未领套餐），**不能据此断言"无活动"**；用 `status` 结合
+   current 与本地状态文件区分"无活动 / 已领取生效中 / 已领取已过期"（2026-10-11 Weekend Build 实测）
+9. ZCode 桌面客户端会向子进程注入 `ZCODE_APP_VERSION`（3.14.5 起实测），脚本会优先采用；
+   带 3.14.5 版本头的请求实测被服务端正常接受，但写死的测试断言需在测试环境内钉住该变量（见 mock 测试）
 
 ## 7. 调用语义与约束
 
-- 每个活动每账号一般限领一次；`preview` 为空或 claim 返回 1001~1005 即为终态，不应继续
+- 每个活动每账号一般限领一次；claim 返回 1001~1005 即为终态。注意 `preview` 为空只说明"没有未领的套餐"，
+  可能是已领取——用 `status`（current + 本地历史）区分，不应盲目重跑或放弃报告
 - 领取是**写操作**：应先 `preview` 确认有可领套餐，再走验证码 + claim；无套餐时不产生任何写请求
 - 重试边界：仅 3007 允许换新验证码参数重试一次；其余失败应立即终止并如实暴露原始错误，调用方不应自行探索替代路径（协议可能已随客户端升级变化，排查属于人工维护）
 - 避免高频重复调用；把验证码风控当作停止信号，而不是对抗目标

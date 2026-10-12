@@ -1,6 +1,6 @@
 ---
 name: zcode-plan-claim
-description: 检查并领取 ZCode 活动卡片限时赠送的编程套餐额度（如限时 token 包/模型额度）。只要用户提到领取 ZCode 活动套餐、活动卡片赠送的 Token/额度，或想检查当前有没有可领活动、查询已生效套餐是否到账，都应使用本技能。核心链路：preview 查询可领套餐 → 浏览器环境完成阿里云无感验证码 → claim 提交 → current 复核。约束：仅限本人账号使用、验证码出现滑块必须停止、终态错误码不重试。不适用：购买付费套餐、管理订阅、API Key 直连配置。
+description: 检查并领取 ZCode 活动卡片限时赠送的编程套餐额度（如限时 token 包/模型额度）。只要用户提到领取 ZCode 活动套餐、活动卡片赠送的 Token/额度，或想检查当前有没有可领活动、查询已生效套餐是否到账、了解领过哪些活动，都应使用本技能。核心链路：status 一站式查询活动状态（可领/已领生效/领取历史）→ 浏览器环境完成阿里云无感验证码 → claim 提交 → current 复核。约束：仅限本人账号使用、验证码出现滑块必须停止、终态错误码不重试。不适用：购买付费套餐、管理订阅、API Key 直连配置。
 ---
 
 # ZCode 活动套餐领取
@@ -13,23 +13,29 @@ description: 检查并领取 ZCode 活动卡片限时赠送的编程套餐额度
 
 ```bash
 node scripts/claim.mjs preview    # 查询当前可领取套餐；退出码 2=有可领, 3=暂无可领
+node scripts/claim.mjs status     # 一站式状态查询（推荐）：可领/已领生效/活动卡片/本地领取历史；退出码 0，分支看 situation 字段
 node scripts/claim.mjs current    # 查询已生效套餐（验证到账）
 node scripts/claim.mjs configs    # 查询客户端配置（诊断用，见第 2 步）
 node scripts/claim.mjs claim --plan <planId> --captcha-param-file <验证码参数文件>   # 领取
 ```
 
 - 凭证自动从 `~/.zcode/v2/credentials.json` 与同目录 `telemetry-state.json` 读取；明文 JWT 不打印、仅发送至 zcode.z.ai。
+- `status` 会把观测到/领取过的套餐写入本地状态文件 `~/.zcode/zcode-plan-claim-state.json`（仅套餐元数据，不含凭证）。⚠️ 不要单用 `preview` 判断"有没有活动"：它只返回**尚未领取**的套餐，领取后返回空数组，会把"已领取"误报成"无活动"。
 
 ## 操作流程
 
-1. **检查是否有可领活动**（只读）：
+1. **检查活动状态**（只读）：
 
    ```bash
-   node scripts/claim.mjs preview
+   node scripts/claim.mjs status
    ```
 
-   - 退出码 3 或 `claimable:false` → 无可领活动，到此结束，不进入后续步骤。
-   - 退出码 2 → 多个可领时取 `priority` 最大的（并列取第一个），本次只领取这一个。
+   按输出中的 `situation` 字段分支：
+
+   - `claimable` → 取 `recommendedPlanId`（即 priority 最大、并列取第一个），进入第 2 步。
+   - `already_claimed_active` → 无可领新活动，报告已生效套餐（名称/额度/适用模型/有效期）后正常结束。
+   - `claimed_expired` → 无可领新活动，本地记录的既往领取均已过期，报告后正常结束。
+   - `none` → 无任何已知活动，一句话报告后正常结束。
 
 2. **生成验证码参数**（仅有可领套餐时执行）：用浏览器自动化打开 `https://zcode.z.ai/cn`，把 [scripts/captcha-inject.js](scripts/captcha-inject.js) 的文件内容作为页面 JS 注入执行一次，之后每 1~2 秒读取 `window.__capResult`，累计不超过 40 秒，`status` 按以下处理：
 

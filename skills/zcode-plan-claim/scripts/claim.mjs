@@ -6,14 +6,16 @@
 // 用法：
 //   node claim.mjs preview                          查询当前可领取的活动套餐
 //   node claim.mjs current                          查询账户已生效套餐
+//   node claim.mjs status                           一站式状态：可领/已领生效/活动卡片/本地领取历史（区分"无活动"与"已领取过"）
 //   node claim.mjs configs                          查询客户端配置（含验证码 SceneId/prefix）
 //   node claim.mjs claim --plan <planId> --captcha-param-file <path>
 //                                                   提交领取（验证码参数由浏览器步骤产出）
 //
-// 退出码：0 成功/已领取；2 有可领套餐（preview）；3 暂无可领套餐；4 失败（含验证码失败）
+// 退出码：0 成功/已领取（status 成功恒为 0，分支看 situation 字段）；2 有可领套餐（preview）；
+//         3 暂无可领套餐；4 失败（含验证码失败）
 
 import { createHash, createDecipheriv } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { homedir, userInfo, platform } from "node:os";
 import { join } from "node:path";
 
@@ -70,6 +72,46 @@ async function loadDeviceMid() {
   return state.deviceMid;
 }
 
+// 本地状态文件：记录观测到/领取过的套餐元数据（不含任何凭证），用于跨次运行区分
+// "无活动"与"已领取过"——preview 只列未领套餐，领取后返回空数组，单靠它无法区分两者
+function statePath() {
+  return (
+    process.env.ZCODE_CLAIM_STATE_FILE ?? join(homedir(), ".zcode", "zcode-plan-claim-state.json")
+  );
+}
+async function loadState() {
+  try {
+    const s = JSON.parse(await readFile(statePath(), "utf8"));
+    if (s && typeof s === "object" && s.plans && typeof s.plans === "object") return s;
+    console.error("[claim] 警告：状态文件格式异常，忽略并重建");
+  } catch (e) {
+    if (e.code !== "ENOENT") {
+      console.error(`[claim] 警告：状态文件读取失败，忽略并重建: ${e.message}`);
+    }
+  }
+  return { version: 1, plans: {} };
+}
+async function saveState(state) {
+  try {
+    await writeFile(statePath(), JSON.stringify(state, null, 2) + "\n");
+  } catch (e) {
+    console.error(`[claim] 警告：状态文件写入失败（领取历史不持久化）: ${e.message}`);
+  }
+}
+// source: "claim"=确证已领取（来自 current 生效列表或领取成功响应）；"preview"=仅 sighting（可领但未确认领取）
+function rememberPlan(state, plan, source) {
+  const now = new Date().toISOString();
+  const prev = state.plans[plan.planId] ?? {};
+  state.plans[plan.planId] = {
+    ...prev,
+    ...plan,
+    firstSeenAt: prev.firstSeenAt ?? now,
+    lastSeenAt: now,
+    claimedAt: source === "claim" ? (prev.claimedAt ?? now) : (prev.claimedAt ?? null),
+    lastPreviewAt: source === "preview" ? now : (prev.lastPreviewAt ?? null),
+  };
+}
+
 async function api(path, { method = "GET", body, captchaParam, extraHeaders } = {}) {
   const jwt = await loadJwt();
   const mid = await loadDeviceMid();
@@ -117,12 +159,8 @@ function showPlan(p) {
   };
 }
 
-async function cmdPreview() {
-  const { status, json } = await api(
-    `/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`,
-  );
-  if (json.code !== 0) fail(`preview 失败 HTTP ${status} code=${json.code} ${json.msg ?? ""}`);
-  const plans = (json.data?.plans ?? []).map((p) => ({
+function formatPreviewPlan(p) {
+  return {
     planId: p.plan_id,
     name: p.name,
     description: p.description,
@@ -133,7 +171,15 @@ async function cmdPreview() {
       unitType: e.unit_type,
       period: e.period,
     })),
-  }));
+  };
+}
+
+async function cmdPreview() {
+  const { status, json } = await api(
+    `/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`,
+  );
+  if (json.code !== 0) fail(`preview 失败 HTTP ${status} code=${json.code} ${json.msg ?? ""}`);
+  const plans = (json.data?.plans ?? []).map(formatPreviewPlan);
   console.log(JSON.stringify({ claimable: plans.length > 0, plans }, null, 2));
   process.exit(plans.length > 0 ? 2 : 3);
 }
@@ -144,6 +190,94 @@ async function cmdCurrent() {
   console.log(
     JSON.stringify({ serverTime: json.data?.server_time, plans: (json.data?.plans ?? []).map(showPlan) }, null, 2),
   );
+}
+
+// 一站式状态查询（只读）：preview（未领可领）+ current（已领生效）+ marketing/touch（活动卡片），
+// 并入本地状态文件后给出无歧义结论——preview 为空时能区分"无活动"与"已领取过"。
+async function cmdStatus() {
+  const state = await loadState();
+
+  const pv = await api(`/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`);
+  if (pv.json.code !== 0) fail(`status: preview 失败 HTTP ${pv.status} code=${pv.json.code} ${pv.json.msg ?? ""}`);
+  const claimablePlans = (pv.json.data?.plans ?? []).map(formatPreviewPlan);
+
+  const cu = await api(`/api/v1/zcode-plan/billing/current`);
+  if (cu.json.code !== 0) fail(`status: current 失败 HTTP ${cu.status} code=${cu.json.code} ${cu.json.msg ?? ""}`);
+  const activePlans = (cu.json.data?.plans ?? []).map(showPlan);
+
+  // 活动卡片：当前下发的营销投放（仅参考，失败不影响结论）
+  let campaigns = [];
+  let campaignsError = "";
+  {
+    const mt = await api(`/api/v1/marketing/touch?seq=1`, { extraHeaders: { "X-Client-Language": "zh-CN" } });
+    if (mt.json.code === 0) {
+      campaigns = (mt.json.data?.deliveries ?? []).map((d) => ({
+        campaignId: d.campaign_id,
+        position: d.resource_position,
+        priority: d.priority,
+        buttons: (d.banner?.buttons ?? []).map((b) => ({
+          text: b.text,
+          actionType: b.action?.type,
+          planId: b.action?.args?.plan_id,
+        })),
+      }));
+    } else {
+      campaignsError = `HTTP ${mt.status} code=${mt.json.code} ${mt.json.msg ?? ""}`;
+    }
+  }
+
+  for (const p of activePlans) rememberPlan(state, p, "claim");
+  for (const p of claimablePlans) rememberPlan(state, p, "preview");
+  await saveState(state);
+
+  const activeIds = new Set(activePlans.map((p) => p.planId));
+  const claimHistory = Object.values(state.plans)
+    .filter((p) => p.claimedAt)
+    .sort((a, b) => (a.firstSeenAt < b.firstSeenAt ? 1 : -1))
+    .map((p) => ({ ...p, currentlyActive: activeIds.has(p.planId) }));
+
+  let recommendedPlanId = null;
+  let situation;
+  let summary;
+  if (claimablePlans.length > 0) {
+    const best = [...claimablePlans].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))[0];
+    recommendedPlanId = best.planId;
+    situation = "claimable";
+    summary = `有 ${claimablePlans.length} 个可领套餐，推荐 ${best.planId}（${best.name}）`;
+  } else if (activePlans.length > 0) {
+    situation = "already_claimed_active";
+    summary = `无可领新活动；已领取套餐生效中：${activePlans.map((p) => p.name).join("、")}`;
+  } else if (claimHistory.length > 0) {
+    situation = "claimed_expired";
+    summary = `无可领新活动；本地记录此前领取过 ${claimHistory.length} 个套餐，均已不在生效列表`;
+  } else {
+    situation = "none";
+    summary = "当前无可领活动，本地也无领取记录";
+  }
+  if (situation !== "claimable" && campaigns.length > 0) {
+    summary += `；有 ${campaigns.length} 张活动卡片在下发`;
+  }
+
+  console.log(
+    JSON.stringify(
+      {
+        serverTime: cu.json.data?.server_time
+          ? new Date(cu.json.data.server_time * 1000).toISOString()
+          : undefined,
+        situation,
+        summary,
+        recommendedPlanId,
+        claimablePlans,
+        activePlans,
+        claimHistory,
+        campaigns,
+        ...(campaignsError ? { campaignsError } : {}),
+      },
+      null,
+      2,
+    ),
+  );
+  process.exit(0);
 }
 
 // 验证码场景参数（SceneId/prefix）会随运营配置轮换，此命令用于人工诊断是否轮换。
@@ -197,7 +331,15 @@ async function cmdClaim(args) {
     plan: json.data?.plan ? showPlan(json.data.plan) : null,
   };
   console.log(JSON.stringify(out, null, 2));
-  if (code === 0) process.exit(0);
+  if (code === 0) {
+    // 领取成功即写入本地历史，之后即使套餐过期，status 也能报告"已领取过"
+    if (json.data?.plan) {
+      const st = await loadState();
+      rememberPlan(st, showPlan(json.data.plan), "claim");
+      await saveState(st);
+    }
+    process.exit(0);
+  }
   // 3007=验证码失败（参数缺失/过期/已用，需取新参数重试一次）
   // 1001~1005=终态失败（如已领取），不要重试
   const terminal = [1001, 1002, 1003, 1004, 1005].includes(Number(code));
@@ -207,9 +349,10 @@ async function cmdClaim(args) {
 const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === "preview") await cmdPreview();
 else if (cmd === "current") await cmdCurrent();
+else if (cmd === "status") await cmdStatus();
 else if (cmd === "configs") await cmdConfigs();
 else if (cmd === "claim") await cmdClaim(rest);
 else {
-  console.log("用法: node claim.mjs <preview|current|configs|claim --plan <id> --captcha-param-file <path>>");
+  console.log("用法: node claim.mjs <preview|current|status|configs|claim --plan <id> --captcha-param-file <path>>");
   process.exit(1);
 }

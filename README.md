@@ -11,7 +11,7 @@
 ## 工作原理
 
 ```
-preview 查询可领套餐 → 浏览器完成阿里云无感验证码 → claim 提交领取 → current 复核到账
+status 查询活动状态（可领/已领生效/领取历史） → 浏览器完成阿里云无感验证码 → claim 提交领取 → current 复核到账
 ```
 
 凭证从本机 ZCode 客户端的 `~/.zcode/v2/credentials.json` 读取（AES-256-GCM 本地解密 `zcodejwttoken`），明文只存在于内存中，仅发送至 `zcode.z.ai`。协议细节见 [skills/zcode-plan-claim/references/CLAIM-LOGIC.md](skills/zcode-plan-claim/references/CLAIM-LOGIC.md)。
@@ -26,10 +26,13 @@ preview 查询可领套餐 → 浏览器完成阿里云无感验证码 → claim
 
 ```bash
 node skills/zcode-plan-claim/scripts/claim.mjs preview    # 查询当前可领取套餐；退出码 2=有可领, 3=暂无可领
+node skills/zcode-plan-claim/scripts/claim.mjs status     # 一站式状态查询（推荐）：可领/已领生效/活动卡片/本地领取历史；结论看 situation 字段
 node skills/zcode-plan-claim/scripts/claim.mjs current    # 查询已生效套餐
 node skills/zcode-plan-claim/scripts/claim.mjs configs    # 查询客户端配置（诊断用，请求规格尚未完全捕获）
 node skills/zcode-plan-claim/scripts/claim.mjs claim --plan <planId> --captcha-param-file <验证码参数文件>   # 领取
 ```
+
+`status` 会把观测到/领取过的套餐记入本地状态文件 `~/.zcode/zcode-plan-claim-state.json`（仅套餐元数据，不含凭证），因此能区分"`preview` 为空"的两种原因：无活动 vs 已领取过（`preview` 只返回尚未领取的套餐，领取后返回空数组）。
 
 `claim` 需要的验证码参数来自浏览器步骤（阿里云 Captcha 2.0 无感验证）：把 [skills/zcode-plan-claim/scripts/captcha-inject.js](skills/zcode-plan-claim/scripts/captcha-inject.js) 注入 `zcode.z.ai/cn` 页面执行，脚本内置等待与滑块判定，终态见 `window.__capResult`（`ok`/`slider`/`sdk_failed`），详见 [SKILL.md](skills/zcode-plan-claim/SKILL.md) 的"操作流程"。若风控要求人工滑块，请直接在客户端内手动领取。
 
@@ -54,7 +57,7 @@ cp -r skills/zcode-plan-claim ~/.claude/skills/
 
 现成的任务提示词见 [AUTOMATION-PROMPT.md](AUTOMATION-PROMPT.md)。实践要点：
 
-- 每日一次足够：先 `preview`，无套餐直接结束（不产生写请求）；有套餐再走验证码与领取
+- 每日一次足够：先 `status`，无可领直接结束（不产生写请求）；有套餐再走验证码与领取。`status` 把已领套餐记入本地历史，避免把"已领取"误报成"无活动"
 - 领取步骤依赖浏览器环境。实测 ZCode 内嵌浏览器路径在桌面会话锁屏 / 远程断开状态下仍可运行（Chromium 引擎内渲染，不依赖桌面可见性），但要求 ZCode 进程存活（建议开启"关闭到托盘"）
 - 若风控要求人工滑块，任务应停止并转为在客户端内手动领取
 
@@ -75,7 +78,7 @@ zcode-plan-claim/
         ├── references/
         │   └── CLAIM-LOGIC.md       # 协议级参考文档（凭证、验证码、错误码、踩坑清单）
         ├── scripts/
-        │   ├── claim.mjs            # CLI：preview / current / configs / claim
+        │   ├── claim.mjs            # CLI：preview / current / status / configs / claim
         │   └── captcha-inject.js    # 验证码注入脚本（内置等待与滑块判定状态机）
         └── tests/
             ├── mock-claim-test.mjs  # 本地 mock 测试（CLI 请求规格与退出码）

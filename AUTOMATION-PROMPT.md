@@ -19,9 +19,10 @@
 ```text
 按已安装的 zcode-plan-claim 技能执行"检查并领取 ZCode 活动套餐"。本次按以下规则执行：
 
-1. 先运行 preview 查询可领套餐（只读操作）：
-   - 退出码 3 或 claimable:false → 今日无可领活动。用一句话报告后正常结束，不要视为错误，不要继续后续步骤。
-   - 退出码 2 → 记下 plan_id，进入第 2 步。
+1. 先运行 status 查询活动状态（只读操作）：
+   - situation=claimable → 记下 recommendedPlanId 作为 plan_id，进入第 2 步。
+   - situation=already_claimed_active → 报告"无可领新活动；已领取套餐生效中"并附套餐名、额度、适用模型与有效期，一句话即可，正常结束，不要视为错误，不要继续后续步骤。
+   - situation=claimed_expired 或 none → 今日无可领活动。用一句话报告后正常结束，不要视为错误，不要继续后续步骤。
 
 2. 按技能"操作流程"第 2 步，用当前环境的浏览器自动化能力完成无感验证码：把技能内 scripts/captcha-inject.js 的内容注入 zcode.z.ai 页面执行一次，轮询读取 window.__capResult 直至终态（累计不超过 40 秒），`ok` 时把 param 原样写入系统临时目录固定文件 cap-param.txt（内容不包裹、不转义）：
    - 终态为 `slider`（15 秒无回调，风控要求人工验证）→ 立即停止，报告"风控要求人工验证，请在 ZCode 客户端内手动领取"。不要重试，不要尝试通过滑块。
@@ -44,5 +45,6 @@
 ## 说明
 
 - 频率：每日一次足够。领取一次性，重复检查没有收益且可能触发风控。
+- 为什么第 1 步用 status 而不是 preview：preview 只返回**尚未领取**的套餐，领取后返回空数组，会把"已领取"误报成"无活动"；status 合并 preview + current + 活动卡片 + 本地领取历史（`~/.zcode/zcode-plan-claim-state.json`），能明确区分四种情况。
 - 锁屏 / 远程断开：ZCode 内嵌浏览器路径在桌面会话不可见时仍可运行（引擎内渲染），但不执行任何模拟桌面的原生 UI 操作。
 - 失败兜底：任何"需要人工验证"的情况都以在 ZCode 客户端内手动点击活动卡片为准。

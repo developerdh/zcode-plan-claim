@@ -1,7 +1,7 @@
 {
   "name": "zcode-plan-claim",
   "version": "0.1.0",
-  "description": "非官方的 ZCode 活动套餐查询与领取 CLI（preview / current / claim）",
+  "description": "非官方的 ZCode 活动套餐查询与领取 CLI（status / preview / current / claim）",
   "type": "module",
   "license": "MIT",
   "engines": {

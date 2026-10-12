@@ -4,7 +4,7 @@
 //
 // 运行：node mock-claim-test.mjs
 import { createHash, createCipheriv, randomBytes } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { homedir, userInfo, platform } from "node:os";
 import { join, dirname } from "node:path";
@@ -78,6 +78,32 @@ const FIXTURES = {
     },
     logid: "20261004004233a84e355b1d43897a906f",
   },
+  previewEmpty: {
+    code: 0, msg: "",
+    data: { server_time: 1791073839, plans: [] },
+    logid: "mock-preview-empty",
+  },
+  currentEmpty: {
+    code: 0, msg: "",
+    data: { server_time: 1791074553, plans: [] },
+    logid: "mock-current-empty",
+  },
+  marketingTouch: {
+    code: 0, msg: "",
+    data: {
+      server_time: 1791073839, language: "zh-CN",
+      deliveries: [{
+        campaign_id: "cmp-weekend", resource_position: "popup", priority: 120,
+        banner: {
+          buttons: [{
+            text: "领取",
+            action: { type: "claim_zcode_plan", args: { plan_id: "zcode-v3-start-plan-trust-1004" } },
+          }],
+        },
+      }],
+    },
+    logid: "mock-touch",
+  },
 };
 
 // ---------- 伪造本地凭证（加密方式与 claim.mjs 解密互为逆过程） ----------
@@ -107,6 +133,8 @@ writeFileSync(captchaFile, CAPTCHA_PARAM);
 // ---------- mock 服务器：记录请求、按场景回放 ----------
 const seen = [];
 let claimScenario = "claimSuccess"; // claimSuccess | claimCaptchaFail | claimAlreadyClaimed
+let previewScenario = "plans"; // plans | empty
+let currentScenario = "plans"; // plans | empty
 
 const server = http.createServer((req, res) => {
   let body = "";
@@ -117,8 +145,13 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
     };
-    if (req.url.startsWith("/api/v1/zcode-plan/billing/preview")) return send(FIXTURES.preview);
-    if (req.url.startsWith("/api/v1/zcode-plan/billing/current")) return send(FIXTURES.current);
+    if (req.url.startsWith("/api/v1/marketing/touch")) return send(FIXTURES.marketingTouch);
+    if (req.url.startsWith("/api/v1/zcode-plan/billing/preview")) {
+      return send(previewScenario === "empty" ? FIXTURES.previewEmpty : FIXTURES.preview);
+    }
+    if (req.url.startsWith("/api/v1/zcode-plan/billing/current")) {
+      return send(currentScenario === "empty" ? FIXTURES.currentEmpty : FIXTURES.current);
+    }
     if (req.url.startsWith("/api/v1/client/configs")) return send(FIXTURES.configs);
     if (req.url.startsWith("/api/v1/zcode-plan/billing/claim")) {
       if (claimScenario === "claimCaptchaFail") return send(FIXTURES.claimCaptchaFail);
@@ -135,8 +168,12 @@ const base = `http://127.0.0.1:${server.address().port}`;
 const env = {
   ...process.env,
   ZCODE_API_BASE: base,
+  // 固定版本号：ZCode 客户端会向子进程注入 ZCODE_APP_VERSION（实测 3.14.5 起），
+  // 不钉住的话断言会随运行环境漂移
+  ZCODE_APP_VERSION: "3.14.4",
   ZCODE_CREDENTIALS_FILE: join(home, "credentials.json"),
   ZCODE_TELEMETRY_FILE: join(home, "telemetry-state.json"),
+  ZCODE_CLAIM_STATE_FILE: join(home, "claim-state.json"),
 };
 
 function run(args) {
@@ -261,6 +298,65 @@ console.log("[8] claim 参数文件内容非法（本地拦截，不发请求）
   r = await run(["claim", "--plan", "mock-plan-x", "--captcha-param-file", badFile]);
   check("非 JSON 内容被拦截（退出码=4）", r.code === 4, `got ${r.code}`);
   check("两次均未发出任何请求", seen.length === before, `requests grew: ${seen.length - before}`);
+}
+
+// 场景9：status —— 可领 + 已领生效 + 活动卡片（一站式合并视图）
+console.log("[9] status（可领套餐存在 → situation=claimable）");
+{
+  previewScenario = "plans";
+  currentScenario = "plans";
+  const r = await run(["status"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("situation=claimable", out.situation === "claimable", out.situation);
+  check("recommendedPlanId=trust-1004", out.recommendedPlanId === "zcode-v3-start-plan-trust-1004");
+  check("activePlans 含 trust-1004", out.activePlans?.[0]?.planId === "zcode-v3-start-plan-trust-1004");
+  check(
+    "campaigns 透出活动卡片及其 plan_id",
+    out.campaigns?.[0]?.campaignId === "cmp-weekend" &&
+      out.campaigns?.[0]?.buttons?.[0]?.planId === "zcode-v3-start-plan-trust-1004",
+  );
+  const st = JSON.parse(readFileSync(join(home, "claim-state.json"), "utf8"));
+  check("状态文件记录 trust-1004 且标记已领取", !!st.plans["zcode-v3-start-plan-trust-1004"]?.claimedAt);
+}
+
+// 场景10：status —— 无可领但已领套餐生效中（区分"已领取"与"无活动"的关键场景）
+console.log("[10] status（无可领 + 生效中 → situation=already_claimed_active）");
+{
+  previewScenario = "empty";
+  const r = await run(["status"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("situation=already_claimed_active", out.situation === "already_claimed_active", out.situation);
+  check(
+    "activePlans 仍在且额度正确",
+    out.activePlans?.length === 1 && out.activePlans[0].entitlements?.[0]?.grantUnits === 100000000,
+  );
+}
+
+// 场景11：status —— preview/current 均空，但本地状态有领取历史
+console.log("[11] status（均空 + 本地有领取记录 → situation=claimed_expired）");
+{
+  currentScenario = "empty";
+  const r = await run(["status"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("situation=claimed_expired", out.situation === "claimed_expired", out.situation);
+  check(
+    "claimHistory 含 trust-1004 且 currentlyActive=false",
+    out.claimHistory?.[0]?.planId === "zcode-v3-start-plan-trust-1004" &&
+      out.claimHistory?.[0]?.currentlyActive === false,
+  );
+}
+
+// 场景12：status —— 三处均无记录（清空本地状态后）
+console.log("[12] status（无可领、无生效、无历史 → situation=none）");
+{
+  writeFileSync(join(home, "claim-state.json"), JSON.stringify({ version: 1, plans: {} }));
+  const r = await run(["status"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("situation=none", out.situation === "none", out.situation);
 }
 
 server.close();
