@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 测试与一致性校验
+        run: |
+          npm test
+          npm run test:plugin
+          npm run sync && git diff --exit-code
+          node scripts/check-release.mjs "${GITHUB_REF_NAME#v}"
+      - name: 打包 plugin.zip 并计算 sha256
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          (cd plugins && zip -qr "../zcode-claim-watcher-${VERSION}.zip" zcode-claim-watcher)
+          sha256sum "zcode-claim-watcher-${VERSION}.zip" | tee "zcode-claim-watcher-${VERSION}.zip.sha256"
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > release-notes.md <<'EOF'
+          ## 安装
+
+          ```bash
+          zcode plugins marketplace add developerdh/zcode-plan-claim
+          zcode plugins install zcode-claim-watcher@zcode-plan-claim
+          ```
+          EOF
+          echo "$(cat release-notes.md)
+          SHA256: $(cut -d' ' -f1 zcode-claim-watcher-${VERSION}.zip.sha256)" > release-notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            "zcode-claim-watcher-${VERSION}.zip" \
+            "zcode-claim-watcher-${VERSION}.zip.sha256" \
+            --title "zcode-claim-watcher v${VERSION}" \
+            --notes-file release-notes.md

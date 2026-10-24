@@ -3,8 +3,5 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ZCode 活动套餐领取监控插件（MCP server 运行时）",
-  "dependencies": {
-    "playwright-core": "^1.64.1"
-  }
+  "description": "ZCode 活动套餐领取监控插件（MCP server 运行时，零依赖）"
 }

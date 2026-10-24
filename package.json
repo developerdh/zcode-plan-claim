@@ -12,6 +12,7 @@
   },
   "scripts": {
     "sync": "node scripts/sync-plugin.mjs",
+    "release": "node scripts/release.mjs",
     "test": "node skills/zcode-plan-claim/tests/mock-claim-test.mjs && node skills/zcode-plan-claim/tests/captcha-inject-test.mjs",
     "test:plugin": "cd plugins/zcode-claim-watcher && node --test"
   },
