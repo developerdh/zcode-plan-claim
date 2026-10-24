@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import { tmpdir } from "node:os";
+import http from "node:http";
 import { join } from "node:path";
 import { createHash, createCipheriv, randomBytes } from "node:crypto";
 import { buildWeixinSendBody, readBotRuntime, sendBotNotification } from "../mcp/lib/notify.mjs";
@@ -122,4 +123,81 @@ test("readBotRuntime：正常读取", async () => {
     assert.equal(rt.botConfig.bots.length, 1);
     assert.deepEqual(rt.credentials, {});
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("readBotRuntime：未传 configRoot 且未设置 ZCODE_DATA_BASE_DIR → 回退 homedir()（.zcode 父目录）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "claim-watcher-home-"));
+  const v2 = join(home, ".zcode", "v2");
+  mkdirSync(v2, { recursive: true });
+  writeFileSync(join(v2, "bot-config.v3.json"), JSON.stringify({ version: 3, bots: [WEIXIN_BOT] }));
+  writeFileSync(join(v2, "bot-state.v3.json"), JSON.stringify({ version: 3, bots: { "bot-wx": { privateRecipientId: "o9cq80wxid0000chat" } } }));
+  const credValue = encrypt("TEST-WX-TOKEN");
+  writeFileSync(join(v2, "credentials.json"), JSON.stringify({ "bot:bot-wx:credential": credValue }));
+  // 回归覆盖：bug 根因是回退值误为 ~/.zcode，外层再拼 .zcode/v2 变成 ~/.zcode/.zcode/v2
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  delete process.env.ZCODE_DATA_BASE_DIR;
+  try {
+    const rt = await readBotRuntime();
+    assert.equal(rt.v2Dir, join(home, ".zcode", "v2"));
+    assert.deepEqual(rt.botConfig, { version: 3, bots: [WEIXIN_BOT] });
+    assert.deepEqual(rt.botState.bots["bot-wx"], { privateRecipientId: "o9cq80wxid0000chat" });
+    assert.equal(rt.credentials["bot:bot-wx:credential"], credValue);
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
+    if (saved.ZCODE_DATA_BASE_DIR === undefined) delete process.env.ZCODE_DATA_BASE_DIR; else process.env.ZCODE_DATA_BASE_DIR = saved.ZCODE_DATA_BASE_DIR;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("端到端：模拟另一台电脑（无 ZCODE_DATA_BASE_DIR、全新 home）→ 自动发现飞书 bot 并送达", async () => {
+  const home = mkdtempSync(join(tmpdir(), "claim-watcher-user-"));
+  // 先切到"另一台电脑"的家目录再加密凭证：与该机器上官方客户端的密钥派生保持一致
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR, ZCODE_FEISHU_BASE: process.env.ZCODE_FEISHU_BASE, ZCODE_CREDENTIAL_SECRET: process.env.ZCODE_CREDENTIAL_SECRET };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  delete process.env.ZCODE_DATA_BASE_DIR;
+  delete process.env.ZCODE_CREDENTIAL_SECRET;
+
+  const v2 = join(home, ".zcode", "v2");
+  mkdirSync(v2, { recursive: true });
+  const feishuBot = { id: "bot-fs-remote", provider: "feishu", enabled: true, credentialRef: "bot:bot-fs-remote:credential", feishuAppId: "cli_remote", providerUserId: "ou_remoteUser0000" };
+  writeFileSync(join(v2, "bot-config.v3.json"), JSON.stringify({ version: 3, bots: [feishuBot] }));
+  writeFileSync(join(v2, "credentials.json"), JSON.stringify({ "bot:bot-fs-remote:credential": encrypt("REMOTE-SECRET") }));
+
+  // 本地 mock 飞书开放平台：校验解密出的 app_secret 与 token 两段式
+  const seen = {};
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      seen[req.url] = { auth: req.headers.authorization, body: body ? JSON.parse(body) : null };
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(req.url.includes("tenant_access_token") ? { code: 0, tenant_access_token: "T-REMOTE" } : { code: 0, data: { message_id: "om_remote" } }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  process.env.ZCODE_FEISHU_BASE = `http://127.0.0.1:${server.address().port}`;
+  try {
+    // 不传 runtime/configRoot/fetchImpl：走 readBotRuntime() 回退发现 → 本机派生解密 → 真实 fetch 推送
+    const results = await sendBotNotification({ message: MSG });
+    assert.deepEqual(results, [{ channel: "bot(feishu)", ok: true }]);
+    const tokenCall = seen["/open-apis/auth/v3/tenant_access_token/internal"];
+    assert.deepEqual(tokenCall.body, { app_id: "cli_remote", app_secret: "REMOTE-SECRET" });
+    const imSend = Object.entries(seen).find(([u]) => u.startsWith("/open-apis/im/v1/messages"))[1];
+    assert.equal(imSend.auth, "Bearer T-REMOTE");
+    assert.equal(imSend.body.receive_id, "ou_remoteUser0000");
+    assert.equal(JSON.parse(imSend.body.content).text, MSG);
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
+    if (saved.ZCODE_DATA_BASE_DIR === undefined) delete process.env.ZCODE_DATA_BASE_DIR; else process.env.ZCODE_DATA_BASE_DIR = saved.ZCODE_DATA_BASE_DIR;
+    if (saved.ZCODE_FEISHU_BASE === undefined) delete process.env.ZCODE_FEISHU_BASE; else process.env.ZCODE_FEISHU_BASE = saved.ZCODE_FEISHU_BASE;
+    if (saved.ZCODE_CREDENTIAL_SECRET === undefined) delete process.env.ZCODE_CREDENTIAL_SECRET; else process.env.ZCODE_CREDENTIAL_SECRET = saved.ZCODE_CREDENTIAL_SECRET;
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+    rmSync(home, { recursive: true, force: true });
+  }
 });

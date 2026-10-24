@@ -17,8 +17,9 @@ const ilinkBase = () => process.env.ZCODE_ILINK_BASE ?? "https://ilinkai.weixin.
 const randUin = () => Buffer.from(String(randomInt(0, 4294967296)), "utf8").toString("base64");
 const readStr = (o, k) => (o && typeof o === "object" && typeof o[k] === "string" ? o[k] : "");
 
+// ZCODE_DATA_BASE_DIR 表示 .zcode 的父目录；未设置时回退 homedir()（与 credentials.mjs 约定一致），.zcode/v2 由 readBotRuntime 统一拼接
 function dataDir() {
-  return process.env.ZCODE_DATA_BASE_DIR ?? join(homedir(), ".zcode");
+  return process.env.ZCODE_DATA_BASE_DIR ?? homedir();
 }
 
 function deriveKey() {
