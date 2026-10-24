@@ -119,7 +119,7 @@ async function runRound(trigger, roundCount) {
       return { ...record };
     }
 
-    const text = `🔔 发现可领活动：${planLabel(best)}\nplan_id: ${best.planId}\n回复「领取活动套餐」即可自动领取（需要 ZCode 保持运行）。`;
+    const text = `🔔 发现可领活动：${planLabel(best)}\nplan_id: ${best.planId}\n回复「领取活动套餐」即可领取（需要 ZCode 保持运行）。`;
     const notifyResults = await sendBotNotification({ message: text });
     markNotified(state, best.planId, "discovered");
     markPlan(state, best.planId, { name: best.name, priority: best.priority, discoveredAt: record.ts });

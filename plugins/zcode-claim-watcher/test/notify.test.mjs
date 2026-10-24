@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { createHash, createCipheriv, randomBytes } from "node:crypto";
 import { buildWeixinSendBody, readBotRuntime, sendBotNotification } from "../mcp/lib/notify.mjs";
 
-const MSG = "🔔 发现可领活动：Test Plan（GLM-5.3-Flash 3亿 token）\nplan_id: p-123\n回复「领取活动套餐」即可自动领取。";
+const MSG = "🔔 发现可领活动：Test Plan（GLM-5.3-Flash 3亿 token）\nplan_id: p-123\n回复「领取活动套餐」即可领取。";
 
 // 凭证夹具：与 notify.mjs 相同派生，加密存储（生产格式），运行时解密互为逆过程
 const deriveKey = () =>
