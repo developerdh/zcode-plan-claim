@@ -359,6 +359,27 @@ console.log("[12] status（无可领、无生效、无历史 → situation=none�
   check("situation=none", out.situation === "none", out.situation);
 }
 
+// 场景13：pending —— 读取本地待领记录（零网络）
+console.log("[13] pending（本地待领记录，优先级排序，排除已领取）");
+{
+  writeFileSync(join(home, "claim-state.json"), JSON.stringify({
+    version: 1,
+    plans: {
+      "plan-low": { planId: "plan-low", name: "Low", discoveredAt: "2026-10-24T00:00:00.000Z", priority: 10 },
+      "plan-high": { planId: "plan-high", name: "High", discoveredAt: "2026-10-24T00:00:00.000Z", priority: 90 },
+      "plan-claimed": { planId: "plan-claimed", name: "Done", discoveredAt: "2026-10-24T00:00:00.000Z", claimedAt: "2026-10-24T01:00:00.000Z" },
+    },
+  }));
+  const before = seen.length;
+  const r = await run(["pending"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("仅含未领取的两条，按优先级排序", out.pending.length === 2 && out.pending[0].planId === "plan-high" && out.pending[1].planId === "plan-low");
+  check("recommendedPlanId=plan-high", out.recommendedPlanId === "plan-high");
+  check("已领取的 plan-claimed 被排除", !out.pending.some((p) => p.planId === "plan-claimed"));
+  check("零网络（无新请求）", seen.length === before, `requests grew: ${seen.length - before}`);
+}
+
 server.close();
 rmSync(home, { recursive: true, force: true });
 console.log(`\n结果: ${pass} 通过, ${failed} 失败`);

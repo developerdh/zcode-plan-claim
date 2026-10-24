@@ -1,65 +1,38 @@
-# zcode-plan-claim
+## 活动监控插件（plugins/zcode-claim-watcher）
 
-非官方的 ZCode 活动套餐查询与领取工具。ZCode 客户端会不定期在左下角投放限时活动卡片（例如赠送 GLM 模型限时 token 额度），本项目将客户端的领取链路整理为：
+本仓库附带一个 ZCode 插件：以 MCP server 常驻会话，按配置间隔只读轮询 `preview`（0 token），发现可领活动后通过**官方绑定的机器人渠道**把通知推送到你的微信/飞书，提醒你回复「领取活动套餐」触发会话领取。所有行为由配置文件驱动（`~/.zcode/zcode-claim-watcher.json`，每轮热加载）：
 
-- 一个零依赖的 Node CLI（查询可领套餐 / 查询已生效套餐 / 提交领取）
-- 一份协议级参考文档（[skills/zcode-plan-claim/references/CLAIM-LOGIC.md](skills/zcode-plan-claim/references/CLAIM-LOGIC.md)）
-- 一个符合 Agent Skills 开放规范的技能（[skills/zcode-plan-claim/SKILL.md](skills/zcode-plan-claim/SKILL.md)），供 AI Agent（如 ZCode）按流程自动执行
-
-> ⚠️ **免责声明**：本项目为个人学习用途的逆向实现，与 ZCode / 智谱官方无关。接口、凭证格式与验证码场景随时可能随客户端升级而变更；活动为平台限时投放且每账号限领一次。请仅用于本人账号，遵守服务条款，自行承担使用风险。本项目不绕过任何人机验证。
-
-## 工作原理
-
+```json
+{
+  "enabled": true,                  // 总开关：false 停止全部计划轮询
+  "intervalMinutes": 10,            // 轮询间隔，缺省 10，下限 5（自动钳制）
+  "activeWindows": [                // 轮询时间窗（缺省=全天候）；支持跨零点（start > end）
+    { "daysOfWeek": [0, 6], "daysOfMonth": [24], "start": "08:00", "end": "23:30" }
+  ],
+  "notify": {                       // 通知事件（固定走官方绑定的机器人渠道，无需配置通道）
+    "events": ["discovered", "claimed", "failed"]
+  }
+}
 ```
-status 查询活动状态（可领/已领生效/领取历史） → 浏览器完成阿里云无感验证码 → claim 提交领取 → current 复核到账
-```
 
-凭证从本机 ZCode 客户端的 `~/.zcode/v2/credentials.json` 读取（AES-256-GCM 本地解密 `zcodejwttoken`），明文只存在于内存中，仅发送至 `zcode.z.ai`。协议细节见 [skills/zcode-plan-claim/references/CLAIM-LOGIC.md](skills/zcode-plan-claim/references/CLAIM-LOGIC.md)。
+MCP 工具：`watcher_status`（状态摘要）/ `watcher_config`（读写配置，会话内自然语言改配置）/ `watcher_history`（轮询历史，按 outcome/时间过滤）/ `check_now`（立即检查一轮，不受开关与时间窗限制）/ `notify_send`（主动推送一条通知，供自动化会话报告结果）。历史文件 `~/.zcode/zcode-claim-watcher-history.jsonl`（每轮一行，保留 7 天且 ≤1000 行），运行日志 `~/.zcode/zcode-claim-watcher.log`。
 
-## 环境要求
+**为什么监控只提醒、不自动领取？** 活动领取需要通过阿里云无感验证码：实测 ZCode 内嵌浏览器（Desktop IAB）可以通过，而无头/CDP 浏览器（含 playwright + 系统 Chrome、CLI 无头后端）会被风控挂起且无法绕过。能过验证码的浏览器只存在于 ZCode 会话内，而监控进程无法创建会话（模型注入、宿主接口均已实测封死）。因此把分工设计为：监控负责 0 token 的「发现与提醒」，领取由用户回复触发、走 ZCode 官方 bot 渠道进入会话，用实证可靠的内嵌浏览器完成——渠道无关（微信/飞书行为一致）、用户全程可在手机上确认。
 
-- Windows（凭证与 ZCode 客户端绑定）+ 已登录的 ZCode 桌面客户端
-- Node.js ≥ 18（无第三方依赖）
-- 领取步骤需要可编程的浏览器环境（ZCode 内嵌浏览器，或 Playwright 驱动的本地 Chromium）
-
-## CLI 用法
+使用：
 
 ```bash
-node skills/zcode-plan-claim/scripts/claim.mjs preview    # 查询当前可领取套餐；退出码 2=有可领, 3=暂无可领
-node skills/zcode-plan-claim/scripts/claim.mjs status     # 一站式状态查询（推荐）：可领/已领生效/活动卡片/本地领取历史；结论看 situation 字段
-node skills/zcode-plan-claim/scripts/claim.mjs current    # 查询已生效套餐
-node skills/zcode-plan-claim/scripts/claim.mjs configs    # 查询客户端配置（诊断用，请求规格尚未完全捕获）
-node skills/zcode-plan-claim/scripts/claim.mjs claim --plan <planId> --captcha-param-file <验证码参数文件>   # 领取
+npm run sync                                   # 技能脚本变更后同步进插件（skills/ 是唯一源）
+npm run test:plugin                            # 监控插件单元测试（55 项：配置/时间窗/定时器/通知/历史/协议）
+zcode plugins marketplace add <仓库>/plugins/marketplace.json
+zcode plugins install zcode-claim-watcher
 ```
 
-`status` 会把观测到/领取过的套餐记入本地状态文件 `~/.zcode/zcode-plan-claim-state.json`（仅套餐元数据，不含凭证），因此能区分"`preview` 为空"的两种原因：无活动 vs 已领取过（`preview` 只返回尚未领取的套餐，领取后返回空数组）。
+说明：
 
-`claim` 需要的验证码参数来自浏览器步骤（阿里云 Captcha 2.0 无感验证）：把 [skills/zcode-plan-claim/scripts/captcha-inject.js](skills/zcode-plan-claim/scripts/captcha-inject.js) 注入 `zcode.z.ai/cn` 页面执行，脚本内置等待与滑块判定，终态见 `window.__capResult`（`ok`/`slider`/`sdk_failed`），详见 [SKILL.md](skills/zcode-plan-claim/SKILL.md) 的"操作流程"。若风控要求人工滑块，请直接在客户端内手动领取。
-
-## 作为 Agent Skill 安装
-
-技能位于 `skills/zcode-plan-claim/`，符合 Agent Skills 开放规范（SKILL.md + scripts/ + references/）：
-
-```bash
-# 方式一：skills CLI 自动安装（识别 skills/ 容器目录）
-npx skills add <owner>/zcode-plan-claim
-
-# 方式二：手动拷贝技能子目录
-# ZCode（或任何读取 ~/.agents/skills 的 Agent）
-cp -r skills/zcode-plan-claim ~/.agents/skills/
-# Claude Code
-cp -r skills/zcode-plan-claim ~/.claude/skills/
-```
-
-安装后对 Agent 说"检查并领取 ZCode 活动"即可触发。注意：SKILL.md 中浏览器步骤默认使用 ZCode 内嵌浏览器，其他 Agent 需替换为自身浏览器自动化能力。
-
-## 定时自动化
-
-现成的任务提示词见 [AUTOMATION-PROMPT.md](AUTOMATION-PROMPT.md)。实践要点：
-
-- 每日一次足够：先 `status`，无可领直接结束（不产生写请求）；有套餐再走验证码与领取。`status` 把已领套餐记入本地历史，避免把"已领取"误报成"无活动"
-- 领取步骤依赖浏览器环境。实测 ZCode 内嵌浏览器路径在桌面会话锁屏 / 远程断开状态下仍可运行（Chromium 引擎内渲染，不依赖桌面可见性），但要求 ZCode 进程存活（建议开启"关闭到托盘"）
-- 若风控要求人工滑块，任务应停止并转为在客户端内手动领取
+- 通知依赖 ZCode 的官方 bot 绑定（扫码 + 在微信/飞书里发一条消息激活会话）；监控读取桌面记录的绑定标识直发推送，无任何额外引导步骤。已验证渠道：**微信**（iLink 中继直发）与**飞书**（开放平台 API）；其他渠道类型（Telegram/Webhook 等）会明确跳过并记日志
+- 插件副本是安装时的快照：技能脚本更新后需 `npm run sync` 再 `zcode plugins update zcode-claim-watcher`
+- 若不需要微信/飞书提醒，可以不绑定 bot 渠道：监控仍持续轮询与记录历史，桌面内随时可查
 
 ## 测试
 

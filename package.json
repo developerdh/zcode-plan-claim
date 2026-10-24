@@ -11,7 +11,9 @@
     "zcode-claim": "skills/zcode-plan-claim/scripts/claim.mjs"
   },
   "scripts": {
-    "test": "node skills/zcode-plan-claim/tests/mock-claim-test.mjs && node skills/zcode-plan-claim/tests/captcha-inject-test.mjs"
+    "sync": "node scripts/sync-plugin.mjs",
+    "test": "node skills/zcode-plan-claim/tests/mock-claim-test.mjs && node skills/zcode-plan-claim/tests/captcha-inject-test.mjs",
+    "test:plugin": "cd plugins/zcode-claim-watcher && node --test"
   },
   "keywords": ["zcode", "zai", "glm", "agent-skills"],
   "repository": {

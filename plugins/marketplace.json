@@ -1,0 +1,14 @@
+{
+  "name": "zcode-plan-claim-local",
+  "plugins": [
+    {
+      "name": "zcode-claim-watcher",
+      "source": "./zcode-claim-watcher",
+      "version": "0.1.0",
+      "description": "ZCode 活动套餐领取监控：后台轮询可领活动并自动领取（滑块即停），支持会话内手动查询/领取",
+      "displayName": "ZCode 活动领取监控",
+      "displayName_i18n": { "zh-CN": "ZCode 活动领取监控" },
+      "category": "productivity"
+    }
+  ]
+}

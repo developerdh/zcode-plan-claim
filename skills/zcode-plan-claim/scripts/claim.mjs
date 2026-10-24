@@ -5,13 +5,14 @@
 //
 // 用法：
 //   node claim.mjs preview                          查询当前可领取的活动套餐
+//   node claim.mjs pending                          读取本地待领记录（零网络）
 //   node claim.mjs current                          查询账户已生效套餐
-//   node claim.mjs status                           一站式状态：可领/已领生效/活动卡片/本地领取历史（区分"无活动"与"已领取过"）
+//   node claim.mjs status                           一站式状态：可领/已领生效/活动卡片/本地领取历史
 //   node claim.mjs configs                          查询客户端配置（含验证码 SceneId/prefix）
 //   node claim.mjs claim --plan <planId> --captcha-param-file <path>
 //                                                   提交领取（验证码参数由浏览器步骤产出）
 //
-// 退出码：0 成功/已领取（status 成功恒为 0，分支看 situation 字段）；2 有可领套餐（preview）；
+// 退出码：0 成功/已领取（status/pending 成功恒为 0，分支看字段）；2 有可领套餐（preview）；
 //         3 暂无可领套餐；4 失败（含验证码失败）
 
 import { createHash, createDecipheriv } from "node:crypto";
@@ -284,6 +285,19 @@ async function cmdStatus() {
 // 注意：该接口的完整请求规格尚未捕获（客户端可能另有参数），实测 3.14.4 下
 // 脚本请求会得到 3001，属已知坑位（见 references/CLAIM-LOGIC.md §6），正常
 // 领取流程不依赖本命令，直接使用 SKILL.md 中的实测默认场景参数。
+// 读取本地待领记录（零网络）：列出状态文件中已发现未领取的活动
+async function cmdPending() {
+  const state = await loadState();
+  const now = Date.now();
+  const pending = Object.values(state.plans ?? {})
+    .filter((p) => p && p.discoveredAt && !p.claimedAt && (!p.endsAt || Date.parse(p.endsAt) > now))
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+  console.log(JSON.stringify({
+    pending: pending.map((p) => ({ planId: p.planId, name: p.name ?? null, priority: p.priority ?? 0, discoveredAt: p.discoveredAt })),
+    recommendedPlanId: pending[0]?.planId ?? null,
+  }, null, 2));
+}
+
 async function cmdConfigs() {
   const { status, json } = await api(
     `/api/v1/client/configs?app_version=${APP_VERSION}&platform=${PLATFORM}`,
@@ -350,9 +364,10 @@ const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === "preview") await cmdPreview();
 else if (cmd === "current") await cmdCurrent();
 else if (cmd === "status") await cmdStatus();
+else if (cmd === "pending") await cmdPending();
 else if (cmd === "configs") await cmdConfigs();
 else if (cmd === "claim") await cmdClaim(rest);
 else {
-  console.log("用法: node claim.mjs <preview|current|status|configs|claim --plan <id> --captcha-param-file <path>>");
+  console.log("用法: node claim.mjs <preview|pending|current|status|configs|claim --plan <id> --captcha-param-file <path>>");
   process.exit(1);
 }

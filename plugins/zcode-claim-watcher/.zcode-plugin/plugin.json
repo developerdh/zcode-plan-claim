@@ -1,0 +1,14 @@
+{
+  "name": "zcode-claim-watcher",
+  "version": "0.1.0",
+  "description": "ZCode 活动套餐领取监控：后台轮询可领活动，发现后自动完成无感验证码与领取（滑块即停），并可手动触发查询/领取",
+  "author": { "name": "developerdh" },
+  "mcpServers": {
+    "claim-watcher": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs"]
+    }
+  },
+  "skills": "./skills",
+  "commands": "./commands"
+}
