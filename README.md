@@ -50,7 +50,9 @@ cp -r skills/zcode-plan-claim ~/.agents/skills/    # Claude Code 为 ~/.claude/s
     { "daysOfWeek": [0, 6], "daysOfMonth": [24], "start": "08:00", "end": "23:30" }
   ],
   "notify": {
-    "events": ["discovered", "claimed", "failed"]
+    "events": ["discovered", "claimed", "failed"],
+    "channels": [],        // 推送渠道：[] = 自动（只发绑定列表第一个启用渠道）；如 ["weixin"]、["feishu"]、["weixin","feishu"]（都发）
+    "failover": true       // 渠道发送报错时自动补发其余绑定渠道（成功一个即止）；false = 不转移
   }
 }
 ```
@@ -63,7 +65,7 @@ MCP 工具：
 | `watcher_config` | 读取或修改监控配置（会话内自然语言改配置） |
 | `watcher_history` | 查询轮询历史（默认最近 10 条，按 outcome/时间过滤） |
 | `check_now` | 立即执行一轮检查，不受开关与时间窗限制 |
-| `notify_send` | 主动推送一条通知（供自动化会话报告结果） |
+| `notify_send` | 主动推送一条通知（供自动化会话报告结果）；可选 `channel` 参数指定 `weixin`/`feishu`/`all`，缺省用配置默认渠道 |
 
 历史文件 `~/.zcode/zcode-claim-watcher-history.jsonl`（每轮一行，保留 7 天且 ≤1000 行），运行日志 `~/.zcode/zcode-claim-watcher.log`。
 
@@ -75,6 +77,8 @@ MCP 工具：
 
 - 依赖 ZCode 官方 bot 绑定：客户端扫码，并在微信/飞书里发一条消息激活会话；监控读取桌面记录的绑定标识直发推送，无额外配置
 - 已验证渠道：**微信**（iLink 中继直发）与**飞书**（开放平台 API）；其他渠道类型（Telegram/Webhook 等）明确跳过并记日志
+- **默认只发一个渠道**：`notify.channels` 为空时取绑定列表第一个启用的渠道，避免双端重复打扰；要都发就配 `["weixin","feishu"]`
+- **失败转移**（`notify.failover`，默认开）：目标渠道发送报错且无任何成功时，按绑定顺序自动补发其余渠道，成功一个即止（转移结果在返回值里带 `failover:true` 明示）；“指定渠道未绑定”属配置问题，只明确报错、不改道
 - 不绑定 bot 也可用：监控仍持续轮询并记录历史，ZCode 桌面内随时可查
 
 ## 技能：查询与领取（zcode-plan-claim）
@@ -97,7 +101,7 @@ node skills/zcode-plan-claim/scripts/claim.mjs claim --plan <planId> --captcha-p
 
 ```bash
 npm test             # 技能测试 66 项：CLI mock 回放 + 验证码注入状态机，不出外网
-npm run test:plugin  # 插件测试 55 项：配置/时间窗/定时器/通知/历史/协议
+npm run test:plugin  # 插件测试 64 项：配置/时间窗/定时器/通知渠道/失败转移/历史/协议
 ```
 
 ## 发布

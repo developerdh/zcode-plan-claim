@@ -1,6 +1,6 @@
 // MCP 协议集成测试：spawn 真实 server.mjs（文件路径隔离到临时目录，ZCode API / iLink / 飞书
-// 均指向本地 mock），验证握手、工具清单、配置读写、check_now 全链路（发现→双渠道推送）、
-// 通知去重与 notify_send。
+// 均指向本地 mock），验证握手、工具清单、配置读写、check_now 全链路（发现→默认单渠道推送）、
+// 通知去重、notify_send 渠道选择与配置驱动。
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
@@ -163,22 +163,17 @@ test("initialize 握手与工具清单", async () => {
   assert.deepEqual(toolsMsg.result.tools.map((t) => t.name).sort(), ["check_now", "notify_send", "watcher_config", "watcher_history", "watcher_status"]);
 });
 
-test("check_now：发现可领套餐 → 双渠道推送（微信 iLink + 飞书开放平台）", async () => {
+test("check_now：发现可领套餐 → 默认单渠道推送（自动=首个绑定渠道）", async () => {
   const out = parseContent(await rpc("tools/call", { name: "check_now", arguments: {} }, { timeoutMs: 20000 }));
   assert.equal(out.outcome, "notified");
   assert.equal(out.planId, "zcode-test-plan");
-  assert.equal(out.notify.filter((r) => r.ok).length, 2);
+  assert.deepEqual(out.notify, [{ channel: "bot(weixin)", ok: true }]);
 
   const wx = ilinkPosts.at(-1);
   assert.equal(wx.url, "/ilink/bot/sendmessage");
   assert.equal(wx.body.msg.to_user_id, RECIPIENT);
   assert.ok(wx.body.msg.item_list[0].text_item.text.includes("Test Plan"));
-
-  const fsSend = feishuPosts.filter((p) => p.url.includes("im/v1/messages")).at(-1);
-  assert.equal(fsSend.body.receive_id, "ou_test0000open");
-  assert.equal(fsSend.body.msg_type, "text");
-  assert.ok(JSON.parse(fsSend.body.content).text.includes("Test Plan"));
-  assert.ok(feishuPosts.some((p) => p.url.includes("tenant_access_token")));
+  assert.equal(feishuPosts.length, 0); // 缺省只发首个绑定渠道，不发飞书
 });
 
 test("check_now：同套餐去重，不再重复推送", async () => {
@@ -189,11 +184,25 @@ test("check_now：同套餐去重，不再重复推送", async () => {
   assert.equal(feishuPosts.filter((p) => p.url.includes("im/v1/messages")).length, fsBefore);
 });
 
-test("notify_send：会话内主动推送（双渠道）", async () => {
-  const out = parseContent(await rpc("tools/call", { name: "notify_send", arguments: { message: "✅ 领取成功：Test Plan" } }));
-  assert.equal(out.results.filter((r) => r.ok).length, 2);
-  assert.equal(ilinkPosts.filter((p) => p.url === "/ilink/bot/sendmessage").length, 2);
-  assert.equal(feishuPosts.filter((p) => p.url.includes("im/v1/messages")).length, 2);
+test("notify_send：缺省=配置默认（自动单渠道）；可指定渠道或 all", async () => {
+  const wxBefore = ilinkPosts.length;
+  const fsBefore = feishuPosts.filter((p) => p.url.includes("im/v1/messages")).length;
+
+  let out = parseContent(await rpc("tools/call", { name: "notify_send", arguments: { message: "✅ 领取成功：Test Plan" } }));
+  assert.deepEqual(out.results, [{ channel: "bot(weixin)", ok: true }]);
+  assert.equal(ilinkPosts.length, wxBefore + 1);
+  assert.equal(feishuPosts.filter((p) => p.url.includes("im/v1/messages")).length, fsBefore);
+
+  out = parseContent(await rpc("tools/call", { name: "notify_send", arguments: { message: "仅飞书", channel: "feishu" } }));
+  assert.deepEqual(out.results, [{ channel: "bot(feishu)", ok: true }]);
+  assert.equal(ilinkPosts.length, wxBefore + 1);
+  assert.equal(feishuPosts.filter((p) => p.url.includes("im/v1/messages")).length, fsBefore + 1);
+
+  out = parseContent(await rpc("tools/call", { name: "notify_send", arguments: { message: "全部渠道", channel: "all" } }));
+  assert.deepEqual(out.results.map((r) => r.channel), ["bot(weixin)", "bot(feishu)"]);
+  assert.ok(out.results.every((r) => r.ok));
+  assert.equal(ilinkPosts.length, wxBefore + 2);
+  assert.equal(feishuPosts.filter((p) => p.url.includes("im/v1/messages")).length, fsBefore + 2);
 });
 
 test("watcher_status：计划状态与历史标签", async () => {
@@ -209,6 +218,17 @@ test("watcher_config：钳制与持久化", async () => {
   const saved = parseContent(await rpc("tools/call", { name: "watcher_config", arguments: { config: { intervalMinutes: 2 } } }));
   assert.equal(saved.config.intervalMinutes, 5);
   assert.equal(JSON.parse(readFileSync(configFile, "utf8")).intervalMinutes, 5);
+});
+
+test("watcher_config：notify.channels 双渠道 → notify_send 缺省双发", async () => {
+  const saved = parseContent(await rpc("tools/call", { name: "watcher_config", arguments: { config: { notify: { channels: ["weixin", "feishu"], failover: false } } } }));
+  assert.deepEqual(saved.config.notify.channels, ["weixin", "feishu"]);
+  assert.equal(saved.config.notify.failover, false);
+  assert.equal(JSON.parse(readFileSync(configFile, "utf8")).notify.channels.length, 2);
+
+  const out = parseContent(await rpc("tools/call", { name: "notify_send", arguments: { message: "双渠道缺省" } }));
+  assert.deepEqual(out.results.map((r) => r.channel), ["bot(weixin)", "bot(feishu)"]);
+  assert.ok(out.results.every((r) => r.ok));
 });
 
 test("watcher_history：按 outcome 过滤", async () => {

@@ -4,10 +4,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   enabled: true,
   intervalMinutes: 10,
   activeWindows: [],
-  notify: { events: ["discovered", "claimed", "failed"] },
+  notify: { events: ["discovered", "claimed", "failed"], channels: [], failover: true },
 });
 
 export const NOTIFY_EVENTS = ["discovered", "claimed", "failed"];
+export const NOTIFY_CHANNELS = ["weixin", "feishu"];
 export const MIN_INTERVAL_MINUTES = 5;
 export const RETENTION_DAYS = 7;
 export const MAX_HISTORY_LINES = 1000;
@@ -17,7 +18,7 @@ const HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
 export function normalizeConfig(raw, { minIntervalMinutes = MIN_INTERVAL_MINUTES } = {}) {
   const warnings = [];
   const src = raw && typeof raw === "object" ? raw : {};
-  const out = { enabled: true, intervalMinutes: DEFAULT_CONFIG.intervalMinutes, activeWindows: [], notify: { events: [...DEFAULT_CONFIG.notify.events] } };
+  const out = { enabled: true, intervalMinutes: DEFAULT_CONFIG.intervalMinutes, activeWindows: [], notify: { events: [...DEFAULT_CONFIG.notify.events], channels: [], failover: true } };
 
   if ("enabled" in src && typeof src.enabled !== "boolean") warnings.push("enabled 非布尔值，已重置为 true");
   else if ("enabled" in src) out.enabled = src.enabled;
@@ -70,7 +71,23 @@ export function normalizeConfig(raw, { minIntervalMinutes = MIN_INTERVAL_MINUTES
           out.notify.events = ev;
         }
       }
-      if ("channels" in n) warnings.push("notify.channels 已废弃：通知固定走官方绑定的机器人渠道，无需配置");
+      // channels：空=自动（绑定列表第一个启用的渠道）；非空数组=指定渠道（按 provider）
+      if ("channels" in n) {
+        if (!Array.isArray(n.channels)) {
+          warnings.push("notify.channels 非数组，已回退为自动（首个启用的绑定渠道）");
+        } else if (n.channels.length) {
+          const valid = [];
+          const dropped = [];
+          for (const c of n.channels) (NOTIFY_CHANNELS.includes(c) ? valid : dropped).push(c);
+          if (dropped.length) warnings.push(`notify.channels 含未知渠道 ${dropped.join(",")}，已忽略（可选：${NOTIFY_CHANNELS.join("/") || "无"}）`);
+          if (valid.length) out.notify.channels = [...new Set(valid)];
+          else warnings.push("notify.channels 无有效渠道，已回退为自动（首个启用的绑定渠道）");
+        }
+      }
+      if ("failover" in n) {
+        if (typeof n.failover !== "boolean") warnings.push("notify.failover 非布尔值，已重置为 true");
+        else out.notify.failover = n.failover;
+      }
     }
   }
 

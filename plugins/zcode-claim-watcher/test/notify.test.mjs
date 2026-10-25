@@ -38,14 +38,14 @@ test("buildWeixinSendBody：字段与桌面客户端同款，换行规范化", (
   assert.equal(body.msg.context_token, undefined);
 });
 
-test("分发：双渠道推送，微信走 iLink、飞书走开放平台（token 两段式）", async () => {
+test("分发：指定 all 双渠道推送，微信走 iLink、飞书走开放平台（token 两段式）", async () => {
   const posts = [];
   const fetchImpl = async (url, opts) => {
     posts.push({ url, body: opts.body ? JSON.parse(opts.body) : null, auth: opts.headers.authorization ?? opts.headers.Authorization });
     if (url.includes("tenant_access_token")) return { ok: true, status: 200, text: async () => JSON.stringify({ code: 0, tenant_access_token: "T-TOKEN", expire: 7200 }) };
     return { ok: true, status: 200, text: async () => url.includes("ilink") ? JSON.stringify({ ret: 0, errcode: 0 }) : JSON.stringify({ code: 0, data: { message_id: "om_x" } }) };
   };
-  const results = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl });
+  const results = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl, channels: "all" });
   assert.equal(results.length, 2);
   assert.deepEqual(results.map((r) => r.ok), [true, true]);
 
@@ -64,16 +64,80 @@ test("分发：双渠道推送，微信走 iLink、飞书走开放平台（token
   assert.equal(JSON.parse(imSend.body.content).text, MSG);
 });
 
-test("分发：单通道失败不影响另一通道", async () => {
+test("失败转移：自动渠道（=微信）报错 → 按绑定顺序补发飞书，结果带 failover:true", async () => {
   const fetchImpl = async (url) => {
     if (url.includes("ilink")) return { ok: false, status: 500, text: async () => "boom" };
     if (url.includes("tenant_access_token")) return { ok: true, status: 200, text: async () => JSON.stringify({ code: 0, tenant_access_token: "T" }) };
     return { ok: true, status: 200, text: async () => JSON.stringify({ code: 0 }) };
   };
   const results = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl });
+  assert.equal(results.length, 2);
+  assert.equal(results[0].channel, "bot(weixin)");
   assert.equal(results[0].ok, false);
   assert.match(results[0].error, /HTTP 500/);
-  assert.equal(results[1].ok, true);
+  assert.deepEqual(results[1], { channel: "bot(feishu)", ok: true, failover: true });
+});
+
+test("渠道选择：缺省=自动，只发绑定列表第一个启用的渠道（不发第二个）", async () => {
+  const posts = [];
+  const fetchImpl = async (url) => {
+    posts.push(url);
+    return { ok: true, status: 200, text: async () => JSON.stringify(url.includes("ilink") ? { ret: 0, errcode: 0 } : { code: 0 }) };
+  };
+  const results = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl });
+  assert.deepEqual(results, [{ channel: "bot(weixin)", ok: true }]);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0], /ilink/); // 未请求飞书
+});
+
+test("渠道选择：指定单渠道只发该渠道；指定双渠道按给定顺序全发", async () => {
+  const posts = [];
+  const fetchImpl = async (url) => {
+    posts.push(url);
+    return { ok: true, status: 200, text: async () => JSON.stringify(url.includes("ilink") ? { ret: 0, errcode: 0 } : { code: 0, tenant_access_token: "T" }) };
+  };
+  const a = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl, channels: ["feishu"] });
+  assert.deepEqual(a, [{ channel: "bot(feishu)", ok: true }]);
+  assert.equal(posts.length, 2); // 飞书 token + im 两段式
+  assert.ok(posts.every((u) => !u.includes("ilink")));
+
+  posts.length = 0;
+  const b = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl, channels: ["feishu", "weixin"] });
+  assert.deepEqual(b.map((r) => r.channel), ["bot(feishu)", "bot(weixin)"]);
+  assert.ok(b.every((r) => r.ok && !r.failover));
+  assert.equal(posts.length, 3);
+});
+
+test("渠道选择：指定渠道未绑定 → skipped 明确报错，不发起请求、不做失败转移", async () => {
+  const rt = { botConfig: { bots: [WEIXIN_BOT] }, botState: RUNTIME.botState, credentials: RUNTIME.credentials };
+  const results = await sendBotNotification({ message: MSG, runtime: rt, fetchImpl: async () => { throw new Error("不应发起请求"); }, channels: ["feishu"] });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].channel, "bot(feishu)");
+  assert.equal(results[0].ok, false);
+  assert.match(results[0].skipped, /未绑定或未启用/);
+});
+
+test("失败转移：failover=false 时主渠道报错不补发", async () => {
+  const fetchImpl = async (url) => {
+    if (url.includes("ilink")) return { ok: false, status: 500, text: async () => "boom" };
+    throw new Error("不应请求飞书");
+  };
+  const results = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl, failover: false });
+  assert.equal(results.length, 1);
+  assert.match(results[0].error, /HTTP 500/);
+});
+
+test("失败转移：主渠道成功不触发转移；全渠道报错时各自明示（第二个带 failover:true）", async () => {
+  const okFetch = async (url) => ({ ok: true, status: 200, text: async () => JSON.stringify(url.includes("ilink") ? { ret: 0, errcode: 0 } : { code: 0 }) });
+  const okResults = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl: okFetch });
+  assert.deepEqual(okResults, [{ channel: "bot(weixin)", ok: true }]);
+
+  const allFail = async () => ({ ok: false, status: 502, text: async () => "down" });
+  const failResults = await sendBotNotification({ message: MSG, runtime: RUNTIME, fetchImpl: allFail });
+  assert.equal(failResults.length, 2);
+  assert.ok(failResults.every((r) => !r.ok && r.error));
+  assert.equal(failResults[0].failover, undefined);
+  assert.equal(failResults[1].failover, true);
 });
 
 test("分发：未启用任何 bot → 跳过", async () => {
@@ -88,7 +152,7 @@ test("分发：未知渠道类型 → 明确跳过不猜测", async () => {
   assert.match(results[0].skipped, /暂未支持/);
 });
 
-test("分发：微信会话未激活（无接收者标识）→ 跳过，飞书正常", async () => {
+test("分发：微信会话未激活（无接收者标识）→ 报错并失败转移至飞书", async () => {
   const rt = {
     botConfig: { bots: [WEIXIN_BOT, FEISHU_BOT] },
     botState: { bots: {} }, // 微信无 privateRecipientId
@@ -100,7 +164,7 @@ test("分发：微信会话未激活（无接收者标识）→ 跳过，飞书�
   };
   const results = await sendBotNotification({ message: MSG, runtime: rt, fetchImpl });
   assert.match(results[0].skipped ?? results[0].error ?? "", /接收者标识|激活/);
-  assert.equal(results[1].ok, true);
+  assert.deepEqual(results[1], { channel: "bot(feishu)", ok: true, failover: true });
 });
 
 test("readBotRuntime：文件缺失回退默认结构", async () => {

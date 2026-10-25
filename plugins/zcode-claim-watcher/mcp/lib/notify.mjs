@@ -144,32 +144,67 @@ async function sendFeishuMessage({ baseUrl, appId, appSecret, openId, text, fetc
 }
 
 // ---------- 分发 ----------
-// 遍历官方绑定的所有已启用 bot，按 provider 分发；返回各通道结果，失败不抛出
-export async function sendBotNotification({ message, runtime, fetchImpl = fetch, timeoutMs = 15000 } = {}) {
+// 渠道选择（channels）：
+//  - "all"          → 全部启用渠道（绑定几个发几个）
+//  - ["weixin",...] → 只发指定 provider（按给定顺序）；未绑定/未启用的明确报 skipped，不静默改道
+//  - 空/缺省        → 自动：绑定列表里第一个启用的 bot 的渠道
+// 失败转移（failover，默认 true）：目标渠道“发送报错”且无任何成功时，按绑定顺序补发
+// 其余未尝试的渠道，成功一个即止，转移结果带 failover:true 明示；
+// “未绑定/不支持”（skipped）属配置问题，只报错不转移。
+// 返回各通道结果，任何失败都不抛出——通知不影响轮询主流程。
+export async function sendBotNotification({ message, runtime, fetchImpl = fetch, timeoutMs = 15000, channels, failover = true } = {}) {
   const rt = runtime ?? (await readBotRuntime());
   const bots = Array.isArray(rt.botConfig?.bots) ? rt.botConfig.bots.filter((b) => b && b.enabled !== false) : [];
   if (!bots.length) return [{ channel: "bot", ok: false, skipped: "未接入任何 bot 渠道" }];
-  const results = [];
-  for (const bot of bots) {
+
+  const wanted =
+    channels === "all"
+      ? [...new Set(bots.map((b) => b.provider))]
+      : Array.isArray(channels) && channels.length
+        ? [...new Set(channels.map(String))]
+        : [bots[0].provider];
+
+  const deliver = async (bot) => {
     const channel = `bot(${bot.provider})`;
     try {
       if (bot.provider === "weixin") {
         await sendWeixinMessage({ bot, botState: rt.botState, credentials: rt.credentials, text: message, fetchImpl, timeoutMs });
-        results.push({ channel, ok: true });
-      } else if (bot.provider === "feishu") {
+        return { channel, ok: true };
+      }
+      if (bot.provider === "feishu") {
         const openId = bot.providerUserId ?? "";
-        if (!openId.startsWith("ou_")) {
-          results.push({ channel, ok: false, skipped: "接收者标识非 open_id，暂不支持推送" });
-          continue;
-        }
+        if (!openId.startsWith("ou_")) return { channel, ok: false, skipped: "接收者标识非 open_id，暂不支持推送" };
         const appSecret = decryptCredential(rt.credentials, bot.credentialRef);
         await sendFeishuMessage({ baseUrl: feishuBase(), appId: bot.feishuAppId, appSecret, openId, text: message, fetchImpl, timeoutMs });
-        results.push({ channel, ok: true });
-      } else {
-        results.push({ channel, ok: false, skipped: `该渠道（${bot.provider}）的主动推送暂未支持` });
+        return { channel, ok: true };
       }
+      return { channel, ok: false, skipped: `该渠道（${bot.provider}）的主动推送暂未支持` };
     } catch (e) {
-      results.push({ channel, ok: false, error: String(e?.message ?? e) });
+      return { channel, ok: false, error: String(e?.message ?? e) };
+    }
+  };
+
+  const results = [];
+  const attempted = new Set();
+  for (const provider of wanted) {
+    const matched = bots.filter((b) => b.provider === provider && !attempted.has(b.id));
+    if (!matched.length) {
+      results.push({ channel: `bot(${provider})`, ok: false, skipped: `指定的渠道 ${provider} 未绑定或未启用（不自动改道）` });
+      continue;
+    }
+    for (const bot of matched) {
+      attempted.add(bot.id);
+      results.push(await deliver(bot));
+    }
+  }
+
+  if (failover !== false && !results.some((r) => r.ok) && results.some((r) => r.error)) {
+    for (const bot of bots) {
+      if (attempted.has(bot.id)) continue;
+      attempted.add(bot.id);
+      const r = await deliver(bot);
+      results.push({ ...r, failover: true });
+      if (r.ok) break;
     }
   }
   return results;

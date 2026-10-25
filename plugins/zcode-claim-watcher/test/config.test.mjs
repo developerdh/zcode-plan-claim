@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_CONFIG, normalizeConfig, MIN_INTERVAL_MINUTES } from "../mcp/lib/config.mjs";
 
-test("空配置回到默认：enabled=true、间隔=10、无窗口、通知含三类事件", () => {
+test("空配置回到默认：enabled=true、间隔=10、无窗口、通知含三类事件、渠道自动、转移开", () => {
   const { config, warnings } = normalizeConfig({});
-  assert.deepEqual(config, { enabled: true, intervalMinutes: 10, activeWindows: [], notify: { events: ["discovered", "claimed", "failed"] } });
+  assert.deepEqual(config, { enabled: true, intervalMinutes: 10, activeWindows: [], notify: { events: ["discovered", "claimed", "failed"], channels: [], failover: true } });
   assert.equal(warnings.length, 0);
   assert.equal(DEFAULT_CONFIG.intervalMinutes, 10);
 });
@@ -41,15 +41,36 @@ test("时间窗：合法条目保留，非法条目丢弃并告警", () => {
   assert.equal(warnings.length, 6);
 });
 
-test("notify：events 过滤（discovered/claimed/failed），channels 已废弃", () => {
+test("notify：events 过滤（discovered/claimed/failed）；channels 未知项丢弃；failover 类型校验", () => {
   const { config, warnings } = normalizeConfig({
     notify: {
       events: ["claimed", "failed", "discovered", 42],
-      channels: [{ type: "webhook", url: "https://a.b" }],
+      channels: ["feishu", "feishu", "sms", "weixin"],
+      failover: "no",
     },
   });
   assert.deepEqual(config.notify.events, ["claimed", "failed", "discovered"]);
-  assert.equal(config.notify.channels, undefined);
-  assert.ok(warnings.some((w) => w.includes("discovered")));
-  assert.ok(warnings.some((w) => w.includes("已废弃")));
+  assert.deepEqual(config.notify.channels, ["feishu", "weixin"]); // 去重保序
+  assert.equal(config.notify.failover, true);
+  assert.ok(warnings.some((w) => w.includes("42")));
+  assert.ok(warnings.some((w) => w.includes("sms")));
+  assert.ok(warnings.some((w) => w.includes("failover")));
+});
+
+test("notify.channels：非数组回退自动；全非法回退自动；空数组=自动；合法组合原样保留", () => {
+  const a = normalizeConfig({ notify: { channels: "weixin" } });
+  assert.deepEqual(a.config.notify.channels, []);
+  assert.ok(a.warnings.some((w) => w.includes("非数组")));
+
+  const b = normalizeConfig({ notify: { channels: ["sms", "tel"] } });
+  assert.deepEqual(b.config.notify.channels, []);
+  assert.ok(b.warnings.some((w) => w.includes("无有效渠道")));
+
+  const c = normalizeConfig({ notify: { channels: [] } });
+  assert.deepEqual(c.config.notify.channels, []);
+  assert.equal(c.warnings.length, 0); // 空数组本就是"自动"的规范化形态
+
+  const d = normalizeConfig({ notify: { channels: ["weixin"], failover: false } });
+  assert.deepEqual(d.config.notify, { events: ["discovered", "claimed", "failed"], channels: ["weixin"], failover: false });
+  assert.equal(d.warnings.length, 0);
 });

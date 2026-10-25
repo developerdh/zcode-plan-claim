@@ -93,7 +93,7 @@ function planLabel(plan) {
 }
 
 // ---------- 轮次执行：轮询 → 发现 → bot 渠道通知 ----------
-async function runRound(trigger, roundCount) {
+async function runRound(trigger, roundCount, cfg) {
   const state = await loadState();
   const record = { ts: new Date().toISOString(), round: roundCount, trigger, outcome: "empty" };
   try {
@@ -120,7 +120,7 @@ async function runRound(trigger, roundCount) {
     }
 
     const text = `🔔 发现可领活动：${planLabel(best)}\nplan_id: ${best.planId}\n回复「领取活动套餐」即可领取（需要 ZCode 保持运行）。`;
-    const notifyResults = await sendBotNotification({ message: text });
+    const notifyResults = await sendBotNotification({ message: text, channels: cfg?.notify?.channels, failover: cfg?.notify?.failover });
     markNotified(state, best.planId, "discovered");
     markPlan(state, best.planId, { name: best.name, priority: best.priority, discoveredAt: record.ts });
     await saveState(state);
@@ -151,10 +151,10 @@ async function loadConfigFile() {
 // ---------- MCP 工具 ----------
 const TOOLS = [
   { name: "watcher_status", description: "查询活动监控运行状态、配置摘要、历史与已领取/已过期套餐（只读）", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
-  { name: "watcher_config", description: "读取或修改监控配置（intervalMinutes≥5 / enabled / activeWindows / notify.events）。传入 config 字段为修改，缺省为读取", inputSchema: { type: "object", properties: { config: { type: "object", description: "完整的新配置对象（整体替换）", additionalProperties: true } }, additionalProperties: false } },
+  { name: "watcher_config", description: "读取或修改监控配置（intervalMinutes≥5 / enabled / activeWindows / notify.events / notify.channels（空=自动发首个绑定渠道） / notify.failover）。传入 config 字段为修改，缺省为读取", inputSchema: { type: "object", properties: { config: { type: "object", description: "完整的新配置对象（整体替换）", additionalProperties: true } }, additionalProperties: false } },
   { name: "watcher_history", description: "查询轮询历史（默认最近 10 条，支持按 outcome/since/until 过滤）", inputSchema: { type: "object", properties: { limit: { type: "number", minimum: 1, maximum: 100 }, outcome: { type: "string", enum: ["empty", "notified", "already_claimed", "already_notified", "notify_failed", "error"] }, since: { type: "string" }, until: { type: "string" } }, additionalProperties: false } },
   { name: "check_now", description: "立即手动执行一轮检查（轮询 → 若发现可领活动则推送通知；不受开关/时间窗限制）", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
-  { name: "notify_send", description: "通过 bot 渠道主动推送一条通知到用户微信/飞书（供定时自动化会话在领取结束后报告结果用）", inputSchema: { type: "object", properties: { message: { type: "string", description: "通知文本" } }, required: ["message"], additionalProperties: false } },
+  { name: "notify_send", description: "通过 bot 渠道主动推送一条通知到用户微信/飞书（供定时自动化会话在领取结束后报告结果用）。channel 缺省用配置默认渠道，可指定 weixin/feishu/all", inputSchema: { type: "object", properties: { message: { type: "string", description: "通知文本" }, channel: { type: "string", enum: ["weixin", "feishu", "all"], description: "推送渠道：缺省=配置默认（notify.channels，空则自动发首个绑定渠道）；all=全部启用渠道" } }, required: ["message"], additionalProperties: false } },
 ];
 
 function jsonResult(obj) {
@@ -205,13 +205,17 @@ async function handleToolCall(name, args = {}) {
   }
   if (name === "check_now") {
     if (checkInFlight) return jsonResult({ busy: true, note: "已有检查在执行中" });
-    checkInFlight = runRound("manual").finally(() => (checkInFlight = null));
+    checkInFlight = runRound("manual", undefined, (await loadConfigFile()).config).finally(() => (checkInFlight = null));
     return jsonResult(await checkInFlight);
   }
   if (name === "notify_send") {
     const message = String(args.message ?? "").trim();
     if (!message) throw new Error("message 不能为空");
-    return jsonResult({ results: await sendBotNotification({ message }) });
+    const channel = args.channel;
+    if (channel !== undefined && !["weixin", "feishu", "all"].includes(channel)) throw new Error(`channel 非法（可选：weixin/feishu/all）`);
+    const { config: cfg } = await loadConfigFile();
+    const channels = channel === undefined ? cfg.notify.channels : channel === "all" ? "all" : [channel];
+    return jsonResult({ results: await sendBotNotification({ message, channels, failover: cfg.notify.failover }) });
   }
   throw new Error(`未知工具: ${name}`);
 }
@@ -264,7 +268,7 @@ function startWatcher() {
   loop = startWatcherLoop({
     getConfig: async () => (await loadConfigFile()).config,
     evaluateRound: async (cfg, roundCount, trigger) => {
-      const r = await runRound(trigger, roundCount);
+      const r = await runRound(trigger, roundCount, cfg);
       log(`轮询完成 #${roundCount}(${trigger}): outcome=${r.outcome}${r.planName ? ` plan=${r.planName}` : ""}${r.error ? ` error=${r.error}` : ""}`);
       return r;
     },
