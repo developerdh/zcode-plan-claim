@@ -83,6 +83,12 @@ const FIXTURES = {
     data: { server_time: 1791073839, plans: [] },
     logid: "mock-preview-empty",
   },
+  // 2026-11-03 实测：app_version 不被服务端认可时（如客户端注入的三段式 "3.17.1"），
+  // preview 返回 code:0 但整体缺 data 字段——历史上曾被脚本误读为"无可领活动"
+  previewNoData: {
+    code: 0, msg: "",
+    logid: "mock-preview-nodata",
+  },
   currentEmpty: {
     code: 0, msg: "",
     data: { server_time: 1791074553, plans: [] },
@@ -103,6 +109,11 @@ const FIXTURES = {
       }],
     },
     logid: "mock-touch",
+  },
+  marketingTouchEmpty: {
+    code: 0, msg: "",
+    data: { server_time: 1791073839, language: "zh-CN", deliveries: [] },
+    logid: "mock-touch-empty",
   },
 };
 
@@ -133,8 +144,9 @@ writeFileSync(captchaFile, CAPTCHA_PARAM);
 // ---------- mock 服务器：记录请求、按场景回放 ----------
 const seen = [];
 let claimScenario = "claimSuccess"; // claimSuccess | claimCaptchaFail | claimAlreadyClaimed
-let previewScenario = "plans"; // plans | empty
+let previewScenario = "plans"; // plans | empty | nodata
 let currentScenario = "plans"; // plans | empty
+let touchScenario = "card"; // card | empty
 
 const server = http.createServer((req, res) => {
   let body = "";
@@ -145,8 +157,11 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
     };
-    if (req.url.startsWith("/api/v1/marketing/touch")) return send(FIXTURES.marketingTouch);
+    if (req.url.startsWith("/api/v1/marketing/touch")) {
+      return send(touchScenario === "empty" ? FIXTURES.marketingTouchEmpty : FIXTURES.marketingTouch);
+    }
     if (req.url.startsWith("/api/v1/zcode-plan/billing/preview")) {
+      if (previewScenario === "nodata") return send(FIXTURES.previewNoData);
       return send(previewScenario === "empty" ? FIXTURES.previewEmpty : FIXTURES.preview);
     }
     if (req.url.startsWith("/api/v1/zcode-plan/billing/current")) {
@@ -168,9 +183,9 @@ const base = `http://127.0.0.1:${server.address().port}`;
 const env = {
   ...process.env,
   ZCODE_API_BASE: base,
-  // 固定版本号：ZCode 客户端会向子进程注入 ZCODE_APP_VERSION（实测 3.14.5 起），
-  // 不钉住的话断言会随运行环境漂移
-  ZCODE_APP_VERSION: "3.14.4",
+  // 固定版本号：必须用四段完整构建号——四段 env 是硬覆盖（跳过动态探测，测试确定性），
+  // 三段式（如客户端注入子进程的 "3.17.1"）会被服务端静默忽略，且探测可用时会优先走探测
+  ZCODE_APP_VERSION: "3.14.4.0",
   ZCODE_CREDENTIALS_FILE: join(home, "credentials.json"),
   ZCODE_TELEMETRY_FILE: join(home, "telemetry-state.json"),
   ZCODE_CLAIM_STATE_FILE: join(home, "claim-state.json"),
@@ -239,7 +254,7 @@ console.log("[3] claim 成功（对照 2026-10-04 成功请求规格）");
   check("X-Aliyun-Captcha-Verify-Param 与文件内容一致", h["x-aliyun-captcha-verify-param"] === CAPTCHA_PARAM);
   check("X-Aliyun-Captcha-Verify-Region: cn", h["x-aliyun-captcha-verify-region"] === "cn");
   check("X-Device-Mid 一致", h["x-device-mid"] === MOCK_MID);
-  check("X-ZCode-App-Version: 3.14.4", h["x-zcode-app-version"] === "3.14.4");
+  check("X-ZCode-App-Version: 3.14.4.0（env 四段硬覆盖）", h["x-zcode-app-version"] === "3.14.4.0");
   check("X-Platform: windows", h["x-platform"] === "windows");
   check("body = {plan_id}", JSON.parse(req?.body ?? "{}").plan_id === "zcode-v3-start-plan-trust-1004");
 }
@@ -349,9 +364,10 @@ console.log("[11] status（均空 + 本地有领取记录 → situation=claimed_
   );
 }
 
-// 场景12：status —— 三处均无记录（清空本地状态后）
-console.log("[12] status（无可领、无生效、无历史 → situation=none）");
+// 场景12：status —— 四处均无记录（清空本地状态、活动卡片也无下发）
+console.log("[12] status（无可领、无生效、无历史、无卡片 → situation=none）");
 {
+  touchScenario = "empty";
   writeFileSync(join(home, "claim-state.json"), JSON.stringify({ version: 1, plans: {} }));
   const r = await run(["status"]);
   check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
@@ -378,6 +394,72 @@ console.log("[13] pending（本地待领记录，优先级排序，排除已领�
   check("recommendedPlanId=plan-high", out.recommendedPlanId === "plan-high");
   check("已领取的 plan-claimed 被排除", !out.pending.some((p) => p.planId === "plan-claimed"));
   check("零网络（无新请求）", seen.length === before, `requests grew: ${seen.length - before}`);
+}
+
+// 场景14：preview 缺 data（2026-11-03 事故形态：app_version 不被认可）→ 显式报错而非"无可领"
+console.log("[14] preview 缺 data 字段（→ 退出码4 + 版本提示）");
+{
+  previewScenario = "nodata";
+  const r = await run(["preview"]);
+  check("退出码=4（协议异常，不是'暂无可领'的退出码3）", r.code === 4, `got ${r.code}`);
+  check(
+    "stderr 提示 app_version 可能不被认可",
+    /不被服务端认可/.test(r.stderr) && /ZCODE_APP_VERSION/.test(r.stderr),
+    r.stderr.slice(0, 160),
+  );
+}
+
+// 场景15：status —— preview 缺 data + current 空 + 活动卡片可领（2026-11-03 事故回归）
+console.log("[15] status（preview缺data + 卡片可领 → situation=campaign_claimable）");
+{
+  touchScenario = "card";
+  writeFileSync(join(home, "claim-state.json"), JSON.stringify({ version: 1, plans: {} }));
+  const r = await run(["status"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("situation=campaign_claimable", out.situation === "campaign_claimable", out.situation);
+  check("recommendedPlanId=trust-1004（来自卡片按钮）", out.recommendedPlanId === "zcode-v3-start-plan-trust-1004");
+  check("recommendedSource=campaign", out.recommendedSource === "campaign");
+  check("previewError 透出缺 data 原因", /缺 data\/plans/.test(out.previewError ?? ""), out.previewError);
+  check(
+    "campaigns 透出卡片按钮 plan_id",
+    out.campaigns?.[0]?.buttons?.[0]?.planId === "zcode-v3-start-plan-trust-1004",
+  );
+  const st = JSON.parse(readFileSync(join(home, "claim-state.json"), "utf8"));
+  const rec = st.plans["zcode-v3-start-plan-trust-1004"];
+  check("卡片 sighting 写入状态文件（discoveredAt，无 claimedAt）", !!rec?.discoveredAt && !rec?.claimedAt);
+}
+
+// 场景16：pending —— 卡片发现的套餐进入本地待领记录（discoveredAt 修复的回归）
+console.log("[16] pending（卡片 sighting → 待领记录可见）");
+{
+  const before = seen.length;
+  const r = await run(["pending"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("pending 含 trust-1004", out.pending.some((p) => p.planId === "zcode-v3-start-plan-trust-1004"));
+  check("recommendedPlanId=trust-1004", out.recommendedPlanId === "zcode-v3-start-plan-trust-1004");
+  check("零网络（无新请求）", seen.length === before, `requests grew: ${seen.length - before}`);
+}
+
+// 场景17：status —— 卡片套餐已被领取过（本地 claimedAt）→ 不误报 campaign_claimable
+console.log("[17] status（卡片套餐已领取过 → 不再判为 campaign_claimable）");
+{
+  previewScenario = "empty";
+  writeFileSync(join(home, "claim-state.json"), JSON.stringify({
+    version: 1,
+    plans: {
+      "zcode-v3-start-plan-trust-1004": {
+        planId: "zcode-v3-start-plan-trust-1004", name: "ZCode Trust Build",
+        discoveredAt: "2026-11-03T00:00:00.000Z", claimedAt: "2026-11-03T01:00:00.000Z",
+      },
+    },
+  }));
+  const r = await run(["status"]);
+  check("退出码=0", r.code === 0, `got ${r.code} ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  check("situation=claimed_expired（而非 campaign_claimable）", out.situation === "claimed_expired", out.situation);
+  check("无推荐套餐", out.recommendedPlanId === null && out.recommendedSource === undefined);
 }
 
 server.close();

@@ -14,9 +14,11 @@ function tmpFile() {
 test("追加与读取：空文件 → 一轮；按 outcome/since 过滤", () => {
   const { file, cleanup } = tmpFile();
   try {
-    appendRound(file, { ts: "2026-10-24T08:00:00.000Z", round: 1, trigger: "schedule", outcome: "empty" });
-    appendRound(file, { ts: "2026-10-24T08:10:00.000Z", round: 2, trigger: "manual", outcome: "claimed", planId: "p1" });
-    appendRound(file, { ts: "2026-10-24T08:20:00.000Z", round: 3, trigger: "schedule", outcome: "failed", reason: "x" });
+    // 相对时间戳：history 有 7 天保留期（RETENTION_DAYS），写死日期会随日历过期失效
+    const t = (minAgo) => new Date(Date.now() - minAgo * 60000).toISOString();
+    appendRound(file, { ts: t(20), round: 1, trigger: "schedule", outcome: "empty" });
+    appendRound(file, { ts: t(10), round: 2, trigger: "manual", outcome: "claimed", planId: "p1" });
+    appendRound(file, { ts: t(5), round: 3, trigger: "schedule", outcome: "failed", reason: "x" });
 
     const all = readRounds(file, { limit: 10 });
     assert.equal(all.total, 3);
@@ -26,7 +28,7 @@ test("追加与读取：空文件 → 一轮；按 outcome/since 过滤", () => 
     assert.equal(claimed.matched, 1);
     assert.equal(claimed.rounds[0].planId, "p1");
 
-    const since = readRounds(file, { since: "2026-10-24T08:15:00.000Z" });
+    const since = readRounds(file, { since: t(7) }); // 介于 round2 与 round3 之间
     assert.equal(since.matched, 1);
     assert.equal(since.rounds[0].round, 3);
 
@@ -68,9 +70,11 @@ test("轮换：7 天前的记录丢弃", () => {
 test("summarize：总数与按结果计数、最近关键轮", () => {
   const { file, cleanup } = tmpFile();
   try {
-    appendRound(file, { ts: "2026-10-24T08:00:00.000Z", outcome: "empty" });
-    appendRound(file, { ts: "2026-10-24T08:10:00.000Z", outcome: "claimed", planName: "X" });
-    appendRound(file, { ts: "2026-10-24T08:20:00.000Z", outcome: "failed", reason: "y" });
+    // 相对时间戳：避免写死日期超过 7 天保留期后失效
+    const t = (minAgo) => new Date(Date.now() - minAgo * 60000).toISOString();
+    appendRound(file, { ts: t(20), outcome: "empty" });
+    appendRound(file, { ts: t(10), outcome: "claimed", planName: "X" });
+    appendRound(file, { ts: t(5), outcome: "failed", reason: "y" });
     const s = summarize(file);
     assert.equal(s.total, 3);
     assert.deepEqual(s.byOutcome, { empty: 1, claimed: 1, failed: 1 });

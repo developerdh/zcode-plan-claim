@@ -13,16 +13,83 @@
 //                                                   提交领取（验证码参数由浏览器步骤产出）
 //
 // 退出码：0 成功/已领取（status/pending 成功恒为 0，分支看字段）；2 有可领套餐（preview）；
-//         3 暂无可领套餐；4 失败（含验证码失败）
+//         3 暂无可领套餐；4 失败（含验证码失败/preview 响应异常）
+//
+// 版本号：ZCODE_APP_VERSION（四段完整构建号）> 动态探测已安装 ZCode.exe 的 ProductVersion
+//         > 环境变量非四段值（告警）> 内置回退值（告警）。服务端只认四段构建号，
+//         三段式（客户端注入子进程的值）会被 preview 静默忽略——见 references/CLAIM-LOGIC.md §6.10
 
 import { createHash, createDecipheriv } from "node:crypto";
+import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir, userInfo, platform } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 const BASE = process.env.ZCODE_API_BASE ?? "https://zcode.z.ai";
-const APP_VERSION = process.env.ZCODE_APP_VERSION ?? "3.14.4";
 const PLATFORM = process.env.ZCODE_PLATFORM ?? "windows";
+
+// ---------- 客户端版本号解析 ----------
+// 服务端口径（经客户端 3.17.1.9553 验证）：preview 只认完整四段构建号，
+// 三段式（如 ZCode 客户端向子进程注入的 "3.17.1"）与旧版本号都会被静默忽略——响应
+// code:0 但整体缺 data 字段。因此解析优先级：
+//   1) ZCODE_APP_VERSION 为四段完整构建号 → 直接采用（显式覆盖/测试钉版本，不触发探测）
+//   2) win32 动态探测已安装 ZCode.exe 的 ProductVersion（四段，如 3.17.1.9553）
+//   3) 环境变量为其他格式 → 采用并告警（仅探测不可用时才会走到）
+//   4) 内置回退值 + 告警
+const FALLBACK_APP_VERSION = "3.17.1.9553";
+const VERSION_RE = /^\d+\.\d+(\.\d+){0,3}$/;
+const VERSION_FULL_RE = /^\d+\.\d+\.\d+\.\d+$/;
+// 单次 PowerShell 覆盖"运行中进程路径 + 常见安装路径"，避免多次 spawn
+const WIN_DETECT_PS = [
+  "$paths=@()",
+  "try { $p = Get-Process -Name ZCode -ErrorAction Stop | Where-Object { $_.Path } | Select-Object -First 1 -ExpandProperty Path; if ($p) { $paths += $p } } catch {}",
+  '$paths += @("$env:ProgramFiles\\ZCode\\ZCode.exe", "$env:LOCALAPPDATA\\Programs\\ZCode\\ZCode.exe")',
+  "foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { Write-Output (Get-Item -LiteralPath $p).VersionInfo.ProductVersion; exit } }",
+].join("; ");
+
+const execFileP = promisify(execFile);
+
+async function detectWindowsAppVersion() {
+  try {
+    const { stdout } = await execFileP(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WIN_DETECT_PS],
+      { timeout: 8000, windowsHide: true },
+    );
+    const v = (stdout.trim().split(/\r?\n/)[0] ?? "").trim();
+    return VERSION_RE.test(v) ? v : null;
+  } catch {
+    return null; // 探测失败不致命：回退 env 三段值或内置默认，preview 缺 data 时会显式报错
+  }
+}
+
+let appVersionPromise = null; // 同一进程只探测一次（status 会连发多个请求）
+function resolveAppVersion() {
+  if (!appVersionPromise) appVersionPromise = doResolveAppVersion();
+  return appVersionPromise;
+}
+async function doResolveAppVersion() {
+  const env = process.env.ZCODE_APP_VERSION?.trim();
+  if (env && VERSION_FULL_RE.test(env)) return { version: env, source: "env" };
+  if (process.platform === "win32") {
+    const detected = await detectWindowsAppVersion();
+    if (detected) return { version: detected, source: "detect" };
+  }
+  if (env && VERSION_RE.test(env)) {
+    console.error(
+      `[claim] 警告：ZCODE_APP_VERSION=${env} 不是四段完整构建号（客户端注入的三段式值不被服务端认可）；动态探测不可用，仍采用该值`,
+    );
+    return { version: env, source: "env-fallback" };
+  }
+  console.error(
+    `[claim] 警告：未能动态获取客户端版本号，回退内置值 ${FALLBACK_APP_VERSION}（可用 ZCODE_APP_VERSION 指定完整构建号）`,
+  );
+  return { version: FALLBACK_APP_VERSION, source: "fallback" };
+}
+async function getAppVersion() {
+  return (await resolveAppVersion()).version;
+}
 
 function fail(msg, code = 4) {
   console.error("[claim] " + msg);
@@ -99,17 +166,41 @@ async function saveState(state) {
     console.error(`[claim] 警告：状态文件写入失败（领取历史不持久化）: ${e.message}`);
   }
 }
-// source: "claim"=确证已领取（来自 current 生效列表或领取成功响应）；"preview"=仅 sighting（可领但未确认领取）
+// source: "claim"=确证已领取（来自 current 生效列表或领取成功响应）；
+//        "preview"/"campaign"=仅 sighting（发现但未确认领取）
 function rememberPlan(state, plan, source) {
   const now = new Date().toISOString();
   const prev = state.plans[plan.planId] ?? {};
+  const clean = Object.fromEntries(Object.entries(plan).filter(([, v]) => v !== undefined));
   state.plans[plan.planId] = {
     ...prev,
-    ...plan,
+    ...clean,
     firstSeenAt: prev.firstSeenAt ?? now,
+    discoveredAt: prev.discoveredAt ?? now, // 首次 sighting 时间，pending 依赖此字段
     lastSeenAt: now,
     claimedAt: source === "claim" ? (prev.claimedAt ?? now) : (prev.claimedAt ?? null),
     lastPreviewAt: source === "preview" ? now : (prev.lastPreviewAt ?? null),
+  };
+}
+
+// marketing/touch 卡片中的套餐 → 状态文件记录（元数据缺失时字段留空，由 rememberPlan 兜底）
+function campaignPlanRecord(c) {
+  const meta = c.meta;
+  return {
+    planId: c.planId,
+    ...(meta?.name ? { name: meta.name } : {}),
+    priority: c.priority,
+    ...(meta?.ends_at ? { endsAt: new Date(meta.ends_at * 1000).toISOString() } : {}),
+    ...((meta?.entitlements ?? []).length
+      ? {
+          entitlements: meta.entitlements.map((e) => ({
+            model: e.show_name,
+            grantUnits: e.grant_units,
+            unitType: e.unit_type,
+            period: e.period,
+          })),
+        }
+      : {}),
   };
 }
 
@@ -119,7 +210,7 @@ async function api(path, { method = "GET", body, captchaParam, extraHeaders } = 
   const headers = {
     Authorization: `Bearer ${jwt}`,
     "X-Device-Mid": mid,
-    "X-ZCode-App-Version": APP_VERSION,
+    "X-ZCode-App-Version": await getAppVersion(),
     "X-Platform": PLATFORM,
     ...extraHeaders,
   };
@@ -176,11 +267,19 @@ function formatPreviewPlan(p) {
 }
 
 async function cmdPreview() {
+  const appVersion = await getAppVersion();
   const { status, json } = await api(
-    `/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`,
+    `/api/v1/zcode-plan/billing/preview?app_version=${appVersion}&platform=${PLATFORM}`,
   );
   if (json.code !== 0) fail(`preview 失败 HTTP ${status} code=${json.code} ${json.msg ?? ""}`);
-  const plans = (json.data?.plans ?? []).map(formatPreviewPlan);
+  if (!json.data || !Array.isArray(json.data.plans)) {
+    fail(
+      `preview 响应缺 data/plans 字段（code=0）：app_version=${appVersion} 可能不被服务端认可` +
+        `（服务端仅认可完整四段构建号，三段式会被静默忽略）。` +
+        `可设置 ZCODE_APP_VERSION=<完整构建号> 后重试，或改用 status 命令查看 marketing/touch 活动卡片`,
+    );
+  }
+  const plans = json.data.plans.map(formatPreviewPlan);
   console.log(JSON.stringify({ claimable: plans.length > 0, plans }, null, 2));
   process.exit(plans.length > 0 ? 2 : 3);
 }
@@ -195,24 +294,40 @@ async function cmdCurrent() {
 
 // 一站式状态查询（只读）：preview（未领可领）+ current（已领生效）+ marketing/touch（活动卡片），
 // 并入本地状态文件后给出无歧义结论——preview 为空时能区分"无活动"与"已领取过"。
+// 卡片判定：preview 受 app_version 口径影响可能静默忽略活动（缺 data 或空列表），
+// 而服务端仍通过 touch 下发可领取的活动卡片（客户端真实链路即 touch→claim）。
+// 因此卡片中的 claim_zcode_plan 按钮在 preview 无可领时作为权威兜底（situation=campaign_claimable）。
 async function cmdStatus() {
   const state = await loadState();
+  const appVersion = await getAppVersion();
 
-  const pv = await api(`/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`);
-  if (pv.json.code !== 0) fail(`status: preview 失败 HTTP ${pv.status} code=${pv.json.code} ${pv.json.msg ?? ""}`);
-  const claimablePlans = (pv.json.data?.plans ?? []).map(formatPreviewPlan);
+  // preview：异常降级为 previewError 字段，不中断 status（卡片判定可兜底）
+  let claimablePlans = [];
+  let previewError = "";
+  {
+    const pv = await api(`/api/v1/zcode-plan/billing/preview?app_version=${appVersion}&platform=${PLATFORM}`);
+    if (pv.json.code !== 0) {
+      previewError = `HTTP ${pv.status} code=${pv.json.code} ${pv.json.msg ?? ""}`;
+    } else if (!pv.json.data || !Array.isArray(pv.json.data.plans)) {
+      previewError = `响应缺 data/plans 字段——app_version=${appVersion} 可能不被服务端认可（可用 ZCODE_APP_VERSION 指定完整构建号）`;
+    } else {
+      claimablePlans = pv.json.data.plans.map(formatPreviewPlan);
+    }
+  }
 
   const cu = await api(`/api/v1/zcode-plan/billing/current`);
   if (cu.json.code !== 0) fail(`status: current 失败 HTTP ${cu.status} code=${cu.json.code} ${cu.json.msg ?? ""}`);
   const activePlans = (cu.json.data?.plans ?? []).map(showPlan);
 
-  // 活动卡片：当前下发的营销投放（仅参考，失败不影响结论）
+  // 活动卡片：当前下发的营销投放；其中 claim_zcode_plan 按钮是可领性的权威来源之一
   let campaigns = [];
+  let campaignClaimPlans = []; // 卡片中可发起领取的 {planId, campaignId, priority, meta}
   let campaignsError = "";
   {
     const mt = await api(`/api/v1/marketing/touch?seq=1`, { extraHeaders: { "X-Client-Language": "zh-CN" } });
     if (mt.json.code === 0) {
-      campaigns = (mt.json.data?.deliveries ?? []).map((d) => ({
+      const deliveries = mt.json.data?.deliveries ?? [];
+      campaigns = deliveries.map((d) => ({
         campaignId: d.campaign_id,
         position: d.resource_position,
         priority: d.priority,
@@ -222,13 +337,37 @@ async function cmdStatus() {
           planId: b.action?.args?.plan_id,
         })),
       }));
+      for (const d of deliveries) {
+        const meta =
+          d.banner?.background?.args?.zcode_plan ?? d.banner?.hero?.args?.zcode_plan ?? null;
+        for (const b of d.banner?.buttons ?? []) {
+          if (b.action?.type === "claim_zcode_plan" && b.action?.args?.plan_id) {
+            campaignClaimPlans.push({
+              planId: b.action.args.plan_id,
+              campaignId: d.campaign_id,
+              priority: meta?.priority ?? d.priority ?? 0,
+              meta,
+            });
+          }
+        }
+      }
     } else {
       campaignsError = `HTTP ${mt.status} code=${mt.json.code} ${mt.json.msg ?? ""}`;
     }
   }
+  // 同一 plan 出现在多张卡片时取 priority 最高；本地已确认领取过的卡片不再视为可领
+  const campaignById = new Map();
+  for (const c of campaignClaimPlans) {
+    const prev = campaignById.get(c.planId);
+    if (!prev || c.priority > prev.priority) campaignById.set(c.planId, c);
+  }
+  const unclaimedCampaignPlans = [...campaignById.values()].filter(
+    (c) => !state.plans[c.planId]?.claimedAt,
+  );
 
   for (const p of activePlans) rememberPlan(state, p, "claim");
   for (const p of claimablePlans) rememberPlan(state, p, "preview");
+  for (const c of campaignById.values()) rememberPlan(state, campaignPlanRecord(c), "campaign");
   await saveState(state);
 
   const activeIds = new Set(activePlans.map((p) => p.planId));
@@ -238,13 +377,21 @@ async function cmdStatus() {
     .map((p) => ({ ...p, currentlyActive: activeIds.has(p.planId) }));
 
   let recommendedPlanId = null;
+  let recommendedSource = null; // "preview" | "campaign"
   let situation;
   let summary;
   if (claimablePlans.length > 0) {
     const best = [...claimablePlans].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))[0];
     recommendedPlanId = best.planId;
+    recommendedSource = "preview";
     situation = "claimable";
     summary = `有 ${claimablePlans.length} 个可领套餐，推荐 ${best.planId}（${best.name}）`;
+  } else if (unclaimedCampaignPlans.length > 0) {
+    const best = [...unclaimedCampaignPlans].sort((a, b) => b.priority - a.priority)[0];
+    recommendedPlanId = best.planId;
+    recommendedSource = "campaign";
+    situation = "campaign_claimable";
+    summary = `preview 未列出可领套餐，但服务端在下发可领取的活动卡片，推荐 ${best.planId}（${best.meta?.name ?? "未知名称"}）——与客户端"点卡片领取"同链路，可直接进入领取流程`;
   } else if (activePlans.length > 0) {
     situation = "already_claimed_active";
     summary = `无可领新活动；已领取套餐生效中：${activePlans.map((p) => p.name).join("、")}`;
@@ -255,8 +402,11 @@ async function cmdStatus() {
     situation = "none";
     summary = "当前无可领活动，本地也无领取记录";
   }
-  if (situation !== "claimable" && campaigns.length > 0) {
-    summary += `；有 ${campaigns.length} 张活动卡片在下发`;
+  if (situation !== "claimable" && situation !== "campaign_claimable" && campaigns.length > 0) {
+    summary += `；有 ${campaigns.length} 张活动卡片在下发（均不可领或已领取）`;
+  }
+  if (previewError) {
+    summary += `；preview 异常：${previewError}`;
   }
 
   console.log(
@@ -268,10 +418,12 @@ async function cmdStatus() {
         situation,
         summary,
         recommendedPlanId,
+        ...(recommendedSource ? { recommendedSource } : {}),
         claimablePlans,
         activePlans,
         claimHistory,
         campaigns,
+        ...(previewError ? { previewError } : {}),
         ...(campaignsError ? { campaignsError } : {}),
       },
       null,
@@ -299,8 +451,9 @@ async function cmdPending() {
 }
 
 async function cmdConfigs() {
+  const appVersion = await getAppVersion();
   const { status, json } = await api(
-    `/api/v1/client/configs?app_version=${APP_VERSION}&platform=${PLATFORM}`,
+    `/api/v1/client/configs?app_version=${appVersion}&platform=${PLATFORM}`,
     { extraHeaders: { "X-Client-Language": "zh-CN" } },
   );
   if (json.code !== 0) fail(`configs 失败 HTTP ${status} code=${json.code} ${json.msg ?? ""}`);

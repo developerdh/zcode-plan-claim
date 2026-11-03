@@ -109,6 +109,8 @@ const env = {
   ZCODE_TELEMETRY_FILE: join(v2, "telemetry-state.json"),
   ZCODE_CLAIM_WATCHER_CONFIG: configFile,
   ZCODE_CLAIM_STATE_FILE: stateFile,
+  // 四段完整构建号 = 硬覆盖，跳过动态探测（避免测试中 spawn PowerShell，也隔离客户端注入的三段式值）
+  ZCODE_APP_VERSION: "3.14.4.0",
   // 注意：不得设置 ZCODE_CREDENTIAL_SECRET —— 凭证夹具用的是默认派生串
   CLAIM_WATCH_FIRST_DELAY_MS: "3600000", // 测试期间不让调度循环自动轮询，由 check_now 驱动
 };

@@ -16,3 +16,4 @@ telemetry-state*.json
 .env
 .env.*
 
+/.zcode
