@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadState, saveState, alreadyHandled, markPlan, shouldNotify, markNotified } from "../mcp/lib/state.mjs";
+import { loadState, saveState, alreadyHandled, markPlan, shouldNotify, markNotified } from "../daemon/lib/state.mjs";
 
 function tmpState() {
   const dir = mkdtempSync(join(tmpdir(), "claim-watcher-state-"));

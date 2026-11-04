@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { startWatcherLoop } from "../mcp/lib/loop.mjs";
-import { planNext } from "../mcp/lib/windows.mjs";
+import { startWatcherLoop } from "../daemon/lib/loop.mjs";
+import { planNext } from "../daemon/lib/windows.mjs";
 
 // 手动计时器：记录 schedule 延迟，测试直接驱动回调（确定性验证节拍逻辑）
 function fakeTimers() {

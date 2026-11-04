@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isWithinWindows, nextWindowOpenDelayMs, planNext } from "../mcp/lib/windows.mjs";
+import { isWithinWindows, nextWindowOpenDelayMs, planNext } from "../daemon/lib/windows.mjs";
 
 const d = (s) => new Date(s); // 本地时间解析
 // 2026-10-24 是周六；2026-10-26 是周一

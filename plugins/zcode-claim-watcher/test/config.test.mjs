@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULT_CONFIG, normalizeConfig, MIN_INTERVAL_MINUTES } from "../mcp/lib/config.mjs";
+import { DEFAULT_CONFIG, normalizeConfig, MIN_INTERVAL_MINUTES } from "../daemon/lib/config.mjs";
 
 test("空配置回到默认：enabled=true、间隔=10、无窗口、通知含三类事件、渠道自动、转移开", () => {
   const { config, warnings } = normalizeConfig({});

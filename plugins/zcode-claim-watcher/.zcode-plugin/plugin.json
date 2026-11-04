@@ -1,14 +1,15 @@
 {
   "name": "zcode-claim-watcher",
-  "version": "0.1.0",
-  "description": "ZCode 活动套餐领取监控：后台轮询可领活动，发现后经官方 bot 渠道推送提醒（不自动领取），并可会话内手动触发查询/领取",
+  "version": "0.2.0",
+  "description": "ZCode 活动套餐领取监控：常驻 daemon 轮询可领活动，发现后经官方 bot 渠道推送提醒（不自动领取），并可会话内手动触发查询/领取",
   "author": { "name": "developerdh" },
   "mcpServers": {
     "claim-watcher": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs"]
+      "type": "http",
+      "url": "http://127.0.0.1:47823/mcp"
     }
   },
+  "hooks": "./hooks",
   "skills": "./skills",
   "commands": "./commands"
 }

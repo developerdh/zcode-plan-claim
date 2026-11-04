@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendRound, readRounds, summarize } from "../mcp/lib/history.mjs";
+import { appendRound, readRounds, summarize } from "../daemon/lib/history.mjs";
 
 function tmpFile() {
   const dir = mkdtempSync(join(tmpdir(), "claim-watcher-hist-"));

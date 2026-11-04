@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import http from "node:http";
 import { join } from "node:path";
 import { createHash, createCipheriv, randomBytes } from "node:crypto";
-import { buildWeixinSendBody, readBotRuntime, sendBotNotification } from "../mcp/lib/notify.mjs";
+import { buildWeixinSendBody, readBotRuntime, sendBotNotification } from "../daemon/lib/notify.mjs";
 
 const MSG = "🔔 发现可领活动：Test Plan（GLM-5.3-Flash 3亿 token）\nplan_id: p-123\n回复「领取活动套餐」即可领取。";
 

@@ -1,5 +1,4 @@
-#!/usr/bin/env node
-// ZCode 活动领取监控 —— 插件 MCP server 入口。
+// ZCode 活动领取监控 —— daemon 业务核心（自插件 mcp/server.mjs 迁移，逻辑等价）。
 // 职责：
 //   1. 后台按配置间隔轮询 marketing/touch 活动卡片（只读 GET），支持配置热加载、总开关与时间窗
 //   2. 发现可领套餐 → 通过官方绑定的 bot 渠道推送微信/飞书通知，提醒用户回复"领取"
@@ -10,28 +9,35 @@
 // 能通过验证码的内嵌浏览器只在 ZCode 会话内可用；因此监控负责"发现与提醒"，
 // 领取动作由用户回复触发的会话（或定时自动化）完成。
 //
-// 自检：node server.mjs --selftest-poll
+// 与 stdio 版的差异：客户端版本号惰性解析（首次 apiGet 前解析并缓存，/health 无需等待）；
+// apiGet 遇"code=0 但缺 data"自动重解析版本号重试一次（应对版本值过期）；单实例由端口绑定保证。
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { normalizeConfig } from "./lib/config.mjs";
 import { appendRound, readRounds, summarize } from "./lib/history.mjs";
-import { acquireWatcherRole, releaseLock } from "./lib/lock.mjs";
-import { startWatcherLoop } from "./lib/loop.mjs";
 import { sendBotNotification } from "./lib/notify.mjs";
 import { alreadyHandled, loadState, markNotified, markPlan, saveState, shouldNotify, statePath } from "./lib/state.mjs";
-import { planNext } from "./lib/windows.mjs";
 
-const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_VERSION = JSON.parse(readFileSync(join(PLUGIN_ROOT, ".zcode-plugin", "plugin.json"), "utf8")).version;
+const SELF_DIR = dirname(fileURLToPath(import.meta.url));
+
+// 版本号：优先读插件清单（daemon 同步副本随插件安装的场景），回退仓库根 package.json（源码直跑场景）
+function pluginVersion() {
+  for (const file of [join(SELF_DIR, "..", ".zcode-plugin", "plugin.json"), join(SELF_DIR, "..", "package.json")]) {
+    try {
+      const v = JSON.parse(readFileSync(file, "utf8")).version;
+      if (typeof v === "string" && v) return v;
+    } catch {}
+  }
+  return "0.0.0-dev";
+}
 
 const BASE = process.env.ZCODE_API_BASE ?? "https://zcode.z.ai";
 const CONFIG_FILE = process.env.ZCODE_CLAIM_WATCHER_CONFIG ?? joinHomedir(".zcode", "zcode-claim-watcher.json");
-const LOCK_FILE = joinHomedir(".zcode", "zcode-claim-watcher.lock");
 const LOG_FILE = joinHomedir(".zcode", "zcode-claim-watcher.log");
 const HISTORY_FILE = joinHomedir(".zcode", "zcode-claim-watcher-history.jsonl");
+const PID_FILE = joinHomedir(".zcode", "zcode-claim-daemon.json");
 
 // ---------- 客户端版本号解析（与技能 claim.mjs 同口径，细节见 references/CLAIM-LOGIC.md §6.9~6.11） ----------
 // 服务端按"客户端声明的版本号"（app.asar 内 package.json 的 version，三段式如 3.17.1）
@@ -76,7 +82,16 @@ async function resolveAppVersion() {
   return { version: FALLBACK_APP_VERSION, source: "fallback" };
 }
 
-let APP_VERSION = FALLBACK_APP_VERSION; // main() 启动时 resolve 覆盖
+// 惰性解析：首次 apiGet 前才解析并缓存 promise（/health 不触发，daemon 监听立即可用）；
+// resetAppVersion 供"缺 data 自动重试"与 CLI 诊断使用
+let appVersionPromise = null;
+function getAppVersion() {
+  if (!appVersionPromise) appVersionPromise = resolveAppVersion();
+  return appVersionPromise;
+}
+function resetAppVersion() {
+  appVersionPromise = null;
+}
 
 function joinHomedir(...parts) {
   const home = process.env.USERPROFILE ?? process.env.HOME;
@@ -92,12 +107,13 @@ function log(msg) {
 }
 
 // ---------- 只读查询 ----------
-async function apiGet(path, extraHeaders) {
+async function apiGet(path, extraHeaders, { retried = false } = {}) {
+  const APP_VERSION = (await getAppVersion()).version;
   const creds = JSON.parse(readFileSync(process.env.ZCODE_CREDENTIALS_FILE ?? joinHomedir(".zcode", "v2", "credentials.json"), "utf8"));
   const enc = creds["zcodejwttoken"];
   if (typeof enc !== "string" || !enc.startsWith("enc:v1:")) throw new Error("credentials.json 中未找到 enc:v1 的 zcodejwttoken");
   const { createHash, createDecipheriv } = await import("node:crypto");
-  const { platform, userInfo } = await import("node:os");
+  const { platform, userInfo, homedir } = await import("node:os");
   let secret;
   try {
     secret = process.env.ZCODE_CREDENTIAL_SECRET?.trim() || `zcode-credential-fallback:${platform()}:${homedir()}:${userInfo().username}`;
@@ -117,6 +133,11 @@ async function apiGet(path, extraHeaders) {
   try { body = JSON.parse(text); } catch { throw new Error(`HTTP ${res.status} 非JSON响应: ${text.slice(0, 200)}`); }
   if (body.code !== 0) throw new Error(`HTTP ${res.status} code=${body.code} ${body.msg ?? ""}`);
   if (body.data === undefined) {
+    if (!retried) {
+      // 版本值可能已过期（ZCode 升级后 env 覆盖/缓存未更新）：重解析一次再试
+      resetAppVersion();
+      return apiGet(path, extraHeaders, { retried: true });
+    }
     throw new Error(`接口 ${path} 返回 code=0 但缺 data 字段——版本值 ${APP_VERSION} 下该接口不返回信封（各接口版本口径不一致，可设置 ZCODE_APP_VERSION 换其他版本值）`);
   }
   return body.data;
@@ -233,21 +254,29 @@ function planStateView(state) {
   }));
 }
 
+// 监控循环句柄由 serve 注入（daemon 是端口锁保证的唯一实例，恒以 watcher 身份轮询）
+let loop = null;
+let checkInFlight = null;
+export function setLoop(l) {
+  loop = l;
+}
+
 async function handleToolCall(name, args = {}) {
   if (name === "watcher_status") {
     const cfg = (await loadConfigFile()).config;
     const state = await loadState();
     const stats = summarize(HISTORY_FILE);
     return jsonResult({
-      role: watcherRole,
-      version: PLUGIN_VERSION,
+      mode: "daemon",
+      pid: process.pid,
+      version: pluginVersion(),
       running: Boolean(loop?.running),
       roundCount: loop?.roundCount ?? 0,
       checkInFlight: Boolean(checkInFlight),
       config: cfg,
       history: { total: stats.total, byOutcome: stats.byOutcome, lastRounds: readRounds(HISTORY_FILE, { limit: 3 }).rounds },
       plans: planStateView(state),
-      paths: { config: CONFIG_FILE, state: statePath(), history: HISTORY_FILE, log: LOG_FILE },
+      paths: { config: CONFIG_FILE, state: statePath(), history: HISTORY_FILE, log: LOG_FILE, pid: PID_FILE },
     });
   }
   if (name === "watcher_config") {
@@ -281,85 +310,4 @@ async function handleToolCall(name, args = {}) {
   throw new Error(`未知工具: ${name}`);
 }
 
-// ---------- MCP stdio（newline-delimited JSON-RPC 2.0） ----------
-function startMcpServer() {
-  let buf = "";
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (chunk) => {
-    buf += chunk;
-    let idx;
-    while ((idx = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, idx).trim();
-      buf = buf.slice(idx + 1);
-      if (line) handleJsonRpcLine(line).catch((e) => log(`RPC 处理异常: ${e.message}`));
-    }
-  });
-  process.stdin.on("end", () => process.exit(0));
-}
-
-async function handleJsonRpcLine(line) {
-  let msg;
-  try { msg = JSON.parse(line); } catch { return; }
-  const reply = (result) => {
-    if (msg.id === undefined) return;
-    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\n");
-  };
-  if (msg.method === "initialize") {
-    reply({ protocolVersion: msg.params?.protocolVersion ?? "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "zcode-claim-watcher", version: PLUGIN_VERSION } });
-  } else if (msg.method === "ping") {
-    reply({});
-  } else if (msg.method === "tools/list") {
-    reply({ tools: TOOLS });
-  } else if (msg.method === "tools/call") {
-    try {
-      reply(await handleToolCall(msg.params?.name, msg.params?.arguments));
-    } catch (e) {
-      if (msg.id === undefined) return;
-      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: String(e?.message ?? e) } }) + "\n");
-    }
-  }
-}
-
-// ---------- 监控循环 ----------
-let watcherRole = "idle";
-let loop = null;
-let checkInFlight = null;
-
-function startWatcher() {
-  loop = startWatcherLoop({
-    getConfig: async () => (await loadConfigFile()).config,
-    evaluateRound: async (cfg, roundCount, trigger) => {
-      const r = await runRound(trigger, roundCount, cfg);
-      log(`轮询完成 #${roundCount}(${trigger}): outcome=${r.outcome}${r.planName ? ` plan=${r.planName}` : ""}${r.error ? ` error=${r.error}` : ""}`);
-      return r;
-    },
-    initialDelayMs: Number(process.env.CLAIM_WATCH_FIRST_DELAY_MS ?? 20 * 1000),
-    logger: log,
-    planNext,
-  });
-  loop.start();
-  log("监控循环已启动");
-}
-
-// ---------- 入口 ----------
-async function main() {
-  const resolved = await resolveAppVersion();
-  APP_VERSION = resolved.version;
-  log(`使用客户端版本号 ${APP_VERSION}（来源 ${resolved.source}）`);
-  const mode = process.argv[2];
-  if (mode === "--selftest-poll") {
-    console.log(JSON.stringify(await pollCampaigns(), null, 2));
-    return;
-  }
-
-  watcherRole = acquireWatcherRole(LOCK_FILE);
-  log(`监控启动 role=${watcherRole}`);
-  if (watcherRole === "watcher") startWatcher();
-  process.on("exit", () => releaseLock(LOCK_FILE));
-  startMcpServer();
-}
-
-main().catch((e) => {
-  log(`致命错误: ${e.message}`);
-  process.exit(1);
-});
+export { TOOLS, handleToolCall, runRound, pollCampaigns, loadConfigFile, pluginVersion, getAppVersion, resetAppVersion, log, joinHomedir, CONFIG_FILE, LOG_FILE, HISTORY_FILE, PID_FILE };
