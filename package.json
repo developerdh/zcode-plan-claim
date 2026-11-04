@@ -1,20 +1,21 @@
 {
   "name": "zcode-plan-claim",
-  "version": "0.1.0",
-  "description": "非官方的 ZCode 活动套餐查询与领取 CLI（status / preview / current / claim）",
+  "version": "0.2.0",
+  "description": "非官方的 ZCode 活动套餐查询与领取 CLI（status / preview / current / claim）与常驻监控 daemon（zcwatch）",
   "type": "module",
   "license": "MIT",
   "engines": {
     "node": ">=18"
   },
   "bin": {
-    "zcode-claim": "skills/zcode-plan-claim/scripts/claim.mjs"
+    "zcode-claim": "skills/zcode-plan-claim/scripts/claim.mjs",
+    "zcwatch": "daemon/cli.mjs"
   },
   "scripts": {
     "sync": "node scripts/sync-plugin.mjs",
     "release": "node scripts/release.mjs",
     "test": "node skills/zcode-plan-claim/tests/mock-claim-test.mjs && node skills/zcode-plan-claim/tests/captcha-inject-test.mjs",
-    "test:plugin": "cd plugins/zcode-claim-watcher && node --test"
+    "test:plugin": "node scripts/run-plugin-tests.mjs"
   },
   "keywords": ["zcode", "zai", "glm", "agent-skills"],
   "repository": {
