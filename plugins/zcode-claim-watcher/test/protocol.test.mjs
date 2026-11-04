@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "mcp", "server.mjs");
 
-// ---------- mock：ZCode API（preview 返回可领套餐）+ iLink + 飞书 ----------
+// ---------- mock：ZCode API（marketing/touch 返回活动卡片）+ iLink + 飞书 ----------
 const PLAN_FIXTURE = {
   plan_id: "zcode-test-plan",
   name: "Test Plan",
@@ -22,8 +22,30 @@ const PLAN_FIXTURE = {
   priority: 100,
   entitlements: [{ entitlement_id: "ent-1", show_name: "GLM-5.3-Flash", meter: "model_usage", unit_type: "token", grant_units: 300000000, period: "one_time" }],
 };
+const CAMPAIGN_FIXTURE = {
+  code: 0, msg: "",
+  data: {
+    server_time: 1792805009, language: "zh-CN",
+    deliveries: [{
+      campaign_id: "cmp-test", resource_position: "banner", priority: 50,
+      banner: {
+        buttons: [{
+          text: { format: "", content: "" },
+          action: { type: "claim_zcode_plan", args: { plan_id: "zcode-test-plan" } },
+        }],
+        background: { type: "bundle", args: { zcode_plan: {
+          plan_id: "zcode-test-plan", name: "Test Plan", priority: 100,
+          starts_at: 1792805009, ends_at: 1792891400,
+          entitlements: [{ show_name: "GLM-5.3-Flash", grant_units: 300000000, unit_type: "token", period: "one_time" }],
+        } } },
+      },
+    }],
+  },
+  logid: "mock-touch",
+};
 const zcodeMock = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
+  if (req.url.startsWith("/api/v1/marketing/touch")) return res.end(JSON.stringify(CAMPAIGN_FIXTURE));
   res.end(JSON.stringify({ code: 0, msg: "", data: { server_time: 1792805009, plans: [PLAN_FIXTURE] } }));
 });
 const ilinkPosts = [];

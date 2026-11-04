@@ -1,6 +1,6 @@
 ---
 name: zcode-plan-claim
-description: 领取 ZCode 活动卡片赠送的编程套餐额度（如限时 token 包/模型额度）。当用户提到领取活动套餐、回复活动通知、或查询活动状态与领取历史时使用。核心流程：确定 plan_id（用户消息 → 本地待领记录 → status 综合查询）→ 内置浏览器无感验证码 → claim 领取 → current 复核。约束：仅限本人账号使用、验证码出现滑块必须停止、终态错误码不重试。不适用：购买付费套餐、管理订阅、API Key 直连配置。
+description: 领取 ZCode 活动卡片赠送的编程套餐额度（如限时 token 包/模型额度）。当用户提到领取活动套餐、回复活动通知、或查询活动状态与领取历史时使用。核心流程：确定 plan_id（用户消息 → 本地待领记录 → status 查询活动状态）→ 内置浏览器无感验证码 → claim 领取 → active 复核。约束：仅限本人账号使用、验证码出现滑块必须停止、终态错误码不重试。不适用：购买付费套餐、管理订阅、API Key 直连配置。
 ---
 
 # ZCode 活动套餐领取
@@ -10,7 +10,7 @@ description: 领取 ZCode 活动卡片赠送的编程套餐额度（如限时 to
 1. **确定 plan_id**，按优先级取第一个可用的：
    - 用户消息或近期通知中已明确给出的 plan_id
    - `node <技能目录>/scripts/claim.mjs pending` —— 读取本地待领记录（零网络），取返回的 `recommendedPlanId`
-   - `node <技能目录>/scripts/claim.mjs status` —— 实时综合查询。`situation` 为 `claimable` 或 `campaign_claimable` 均视为可领，取返回的 `recommendedPlanId`；输出含 `previewError` 时不阻断，仍按 `recommendedPlanId` 继续
+   - `node <技能目录>/scripts/claim.mjs status` —— 查询活动状态（唯一权威判定，以服务端下发的活动卡片为准）。退出码 `0` 表示存在可领取活动，取返回的 `recommendedPlanId`；退出码 `1` 表示无可领活动（分支看 `situation`），告知用户并结束；退出码 `4` 为查询失败，如实报告原因
    - 均无可领套餐 → 告知用户并结束
 2. **无感验证码**：用浏览器自动化打开 `https://zcode.z.ai/cn`，把 [scripts/captcha-inject.js](scripts/captcha-inject.js) 的文件内容作为页面 JS 注入执行一次，之后每 1~2 秒读取 `window.__capResult`，累计不超过 40 秒：
    - `ok`（含 `param`）→ 把 `param` 原样写入系统临时目录固定文件 `cap-param.txt`（内容不包裹、不转义、不打印）
@@ -21,23 +21,22 @@ description: 领取 ZCode 活动卡片赠送的编程套餐额度（如限时 to
    - `success:true` → 领取成功，删除 `cap-param.txt`
    - `code:3007` → 回到第 2 步换新验证码参数重试一次；再失败即停
    - `code:1001~1005` → 终态（含已领取），视为完成，不重试
-4. **复核**：`node <技能目录>/scripts/claim.mjs current` 确认 `status:"active"`，向用户报告套餐名、额度、适用模型与有效期。`current` 为空时以领取响应为准（套餐可能带未来生效时间）
+4. **复核**：`node <技能目录>/scripts/claim.mjs active` 确认 `status:"active"`，向用户报告套餐名、额度、适用模型与有效期。`active` 列表为空时以领取响应为准（套餐可能带未来生效时间）
 
 ## 脚本
 
 `scripts/claim.mjs`（Node ≥ 18，无第三方依赖）：
 
 ```bash
-node scripts/claim.mjs preview    # 查询可领取套餐；退出码 2=有可领, 3=暂无可领, 4=响应异常
-node scripts/claim.mjs pending    # 读取本地待领记录（零网络）；分支看 recommendedPlanId
-node scripts/claim.mjs status     # 综合状态查询（可领性权威判定）；分支看 situation / recommendedPlanId
-node scripts/claim.mjs current    # 查询已生效套餐（复核到账）
-node scripts/claim.mjs configs    # 查询客户端配置（诊断用）
+node scripts/claim.mjs status    # 查询活动状态（唯一权威判定）；退出码 0=有可领活动, 1=无可领, 4=查询失败
+node scripts/claim.mjs pending   # 读取本地待领记录（零网络）；分支看 recommendedPlanId
+node scripts/claim.mjs active    # 查询已生效套餐（复核到账）
+node scripts/claim.mjs configs   # 查询客户端配置（诊断用）
 node scripts/claim.mjs claim --plan <planId> --captcha-param-file <验证码参数文件>   # 领取
 ```
 
 - 凭证自动从 `~/.zcode/v2/credentials.json` 与同目录 `telemetry-state.json` 读取；明文 JWT 不打印、仅发送至 zcode.z.ai。
-- 客户端版本号解析顺序：`ZCODE_APP_VERSION` 指定的四段完整构建号 → win32 动态探测已安装 ZCode.exe 的 ProductVersion → 内置回退值。服务端仅认可四段完整构建号；接口响应缺 `data` 字段时命令显式报错（详见 [references/CLAIM-LOGIC.md](references/CLAIM-LOGIC.md)）。
+- 客户端版本号解析顺序：`ZCODE_APP_VERSION`（任意 `x.y[.z[.w]]` 格式）→ 动态读取已安装客户端 app.asar 内 package.json 的 `version`（如 `3.17.1`）→ 内置回退值。服务端按该版本值做定向过滤：`marketing/touch` 仅对客户端真实版本值下发活动卡片。详见 [references/CLAIM-LOGIC.md](references/CLAIM-LOGIC.md) §6.9~6.11。
 
 ## 失败处理原则
 

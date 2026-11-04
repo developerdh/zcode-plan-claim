@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ZCode 活动领取监控 —— 插件 MCP server 入口。
 // 职责：
-//   1. 后台按配置间隔轮询 billing/preview（只读 GET，0 token），支持配置热加载、总开关与时间窗
+//   1. 后台按配置间隔轮询 marketing/touch 活动卡片（只读 GET），支持配置热加载、总开关与时间窗
 //   2. 发现可领套餐 → 通过官方绑定的 bot 渠道推送微信/飞书通知，提醒用户回复"领取"
 //      （领取由用户回复触发的 ZCode 会话执行：内置浏览器过验证码，实证可靠）
 //   3. MCP 工具：watcher_status / watcher_config / watcher_history / check_now / notify_send
@@ -33,41 +33,46 @@ const LOCK_FILE = joinHomedir(".zcode", "zcode-claim-watcher.lock");
 const LOG_FILE = joinHomedir(".zcode", "zcode-claim-watcher.log");
 const HISTORY_FILE = joinHomedir(".zcode", "zcode-claim-watcher-history.jsonl");
 
-// ---------- 客户端版本号解析（与技能 claim.mjs 同口径，细节见 references/CLAIM-LOGIC.md §6.10） ----------
-// 服务端只认完整四段构建号；客户端向子进程注入的三段式 ZCODE_APP_VERSION（如 "3.17.1"）
-// 会被 preview 静默忽略（code:0 但缺 data）。因此：四段 env 硬覆盖 > win32 动态探测 exe
-// ProductVersion > env 其他格式（告警）> 内置回退值（告警）。
-const FALLBACK_APP_VERSION = "3.17.1.9553";
+// ---------- 客户端版本号解析（与技能 claim.mjs 同口径，细节见 references/CLAIM-LOGIC.md §6.9~6.11） ----------
+// 服务端按"客户端声明的版本号"（app.asar 内 package.json 的 version，三段式如 3.17.1）
+// 做定向过滤：marketing/touch 仅对该版本值下发活动卡片，其他版本值静默返回空 deliveries。
+// 因此：ZCODE_APP_VERSION（任意合法格式）硬覆盖 > 动态读取 app.asar 包版本 > 内置回退值（告警）。
+const FALLBACK_APP_VERSION = "3.17.1";
 const VERSION_RE = /^\d+\.\d+(\.\d+){0,3}$/;
-const VERSION_FULL_RE = /^\d+\.\d+\.\d+\.\d+$/;
-const WIN_DETECT_PS = [
-  "$paths=@()",
-  "try { $p = Get-Process -Name ZCode -ErrorAction Stop | Where-Object { $_.Path } | Select-Object -First 1 -ExpandProperty Path; if ($p) { $paths += $p } } catch {}",
-  '$paths += @("$env:ProgramFiles\\ZCode\\ZCode.exe", "$env:LOCALAPPDATA\\Programs\\ZCode\\ZCode.exe")',
-  "foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { Write-Output (Get-Item -LiteralPath $p).VersionInfo.ProductVersion; exit } }",
-].join("; ");
+
+async function detectAsarPackageVersion() {
+  const { open } = await import("node:fs/promises");
+  let fh = null;
+  try {
+    fh = await open("D:\\Program Files\\ZCode\\resources\\app.asar", "r");
+    const headBuf = Buffer.alloc(16);
+    await fh.read(headBuf, 0, 16, 0);
+    const jsonSize = headBuf.readUInt32LE(12);
+    const head = Buffer.alloc(jsonSize);
+    await fh.read(head, 0, jsonSize, 16);
+    const header = JSON.parse(head.toString("utf8"));
+    const pkgNode = header.files?.["package.json"];
+    if (!pkgNode) return null;
+    const dataBase = 16 + jsonSize;
+    const body = Buffer.alloc(pkgNode.size);
+    await fh.read(body, 0, pkgNode.size, dataBase + Number(pkgNode.offset));
+    const version = JSON.parse(body.toString("utf8")).version;
+    return VERSION_RE.test(String(version).trim()) ? String(version).trim() : null;
+  } catch {
+    return null;
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
 
 async function resolveAppVersion() {
   const env = process.env.ZCODE_APP_VERSION?.trim();
-  if (env && VERSION_FULL_RE.test(env)) return { version: env, source: "env" };
+  if (env && VERSION_RE.test(env)) return { version: env, source: "env" };
   if (process.platform === "win32") {
-    try {
-      const { execFile } = await import("node:child_process");
-      const { promisify } = await import("node:util");
-      const { stdout } = await promisify(execFile)(
-        "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WIN_DETECT_PS],
-        { timeout: 8000, windowsHide: true },
-      );
-      const v = (stdout.trim().split(/\r?\n/)[0] ?? "").trim();
-      if (VERSION_RE.test(v)) return { version: v, source: "detect" };
-    } catch {}
+    const detected = await detectAsarPackageVersion();
+    if (detected) return { version: detected, source: "detect" };
   }
-  if (env && VERSION_RE.test(env)) {
-    log(`警告：ZCODE_APP_VERSION=${env} 不是四段完整构建号（服务端可能忽略），动态探测不可用，仍采用该值`);
-    return { version: env, source: "env-fallback" };
-  }
-  log(`警告：未能动态获取客户端版本号，回退内置值 ${FALLBACK_APP_VERSION}（可用 ZCODE_APP_VERSION 指定完整构建号）`);
+  log(`警告：未能动态获取客户端版本号，回退内置值 ${FALLBACK_APP_VERSION}（可用 ZCODE_APP_VERSION 指定）`);
   return { version: FALLBACK_APP_VERSION, source: "fallback" };
 }
 
@@ -87,7 +92,7 @@ function log(msg) {
 }
 
 // ---------- 只读查询 ----------
-async function apiGet(path) {
+async function apiGet(path, extraHeaders) {
   const creds = JSON.parse(readFileSync(process.env.ZCODE_CREDENTIALS_FILE ?? joinHomedir(".zcode", "v2", "credentials.json"), "utf8"));
   const enc = creds["zcodejwttoken"];
   if (typeof enc !== "string" || !enc.startsWith("enc:v1:")) throw new Error("credentials.json 中未找到 enc:v1 的 zcodejwttoken");
@@ -106,26 +111,40 @@ async function apiGet(path) {
   const jwt = Buffer.concat([d.update(Buffer.from(ct, "base64url")), d.final()]).toString("utf8");
   const telemetry = JSON.parse(readFileSync(process.env.ZCODE_TELEMETRY_FILE ?? joinHomedir(".zcode", "v2", "telemetry-state.json"), "utf8"));
   if (!telemetry.deviceMid) throw new Error("telemetry-state.json 中无 deviceMid");
-  const res = await fetch(BASE + path, { headers: { Authorization: `Bearer ${jwt}`, "X-Device-Mid": telemetry.deviceMid, "X-ZCode-App-Version": APP_VERSION, "X-Platform": "windows" } });
+  const res = await fetch(BASE + path, { headers: { Authorization: `Bearer ${jwt}`, "X-Device-Mid": telemetry.deviceMid, "X-ZCode-App-Version": APP_VERSION, "X-Platform": "windows", ...extraHeaders } });
   const text = await res.text();
   let body;
   try { body = JSON.parse(text); } catch { throw new Error(`HTTP ${res.status} 非JSON响应: ${text.slice(0, 200)}`); }
   if (body.code !== 0) throw new Error(`HTTP ${res.status} code=${body.code} ${body.msg ?? ""}`);
   if (body.data === undefined) {
-    throw new Error(`接口 ${path} 返回 code=0 但缺 data 字段——X-ZCode-App-Version=${APP_VERSION} 可能不被服务端认可（服务端仅认可完整四段构建号，可设置 ZCODE_APP_VERSION 修复）`);
+    throw new Error(`接口 ${path} 返回 code=0 但缺 data 字段——版本值 ${APP_VERSION} 下该接口不返回信封（各接口版本口径不一致，可设置 ZCODE_APP_VERSION 换其他版本值）`);
   }
   return body.data;
 }
 
-async function pollPreview() {
-  const data = await apiGet(`/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=windows`);
-  const plans = (data.plans ?? []).map((p) => ({
-    planId: p.plan_id,
-    name: p.name,
-    description: p.description,
-    priority: p.priority ?? 0,
-    entitlements: (p.entitlements ?? []).map((e) => ({ model: e.show_name, grantUnits: e.grant_units, unitType: e.unit_type, period: e.period })),
-  }));
+// 活动卡片轮询（权威判定源）：解析 claim_zcode_plan 按钮，返回卡片上全部可领套餐（不做本地过滤，
+// 已领取/已通知的去重由 runRound 依据本地状态处理）。卡片类活动不出现在 billing/preview 中。
+async function pollCampaigns() {
+  const data = await apiGet(`/api/v1/marketing/touch?seq=1`, { "X-Client-Language": "zh-CN" });
+  const seen = new Map();
+  for (const d of data.deliveries ?? []) {
+    const meta = d.banner?.background?.args?.zcode_plan ?? d.banner?.hero?.args?.zcode_plan ?? null;
+    for (const b of d.banner?.buttons ?? []) {
+      if (b.action?.type !== "claim_zcode_plan" || !b.action?.args?.plan_id) continue;
+      const planId = b.action.args.plan_id;
+      const priority = meta?.priority ?? d.priority ?? 0;
+      const prev = seen.get(planId);
+      if (!prev || priority > prev.priority) {
+        seen.set(planId, {
+          planId,
+          name: meta?.name ?? planId,
+          priority,
+          entitlements: (meta?.entitlements ?? []).map((e) => ({ model: e.show_name, grantUnits: e.grant_units, unitType: e.unit_type, period: e.period })),
+        });
+      }
+    }
+  }
+  const plans = [...seen.values()].sort((a, b) => b.priority - a.priority);
   return { serverTime: data.server_time, claimable: plans.length > 0, plans };
 }
 
@@ -139,12 +158,12 @@ async function runRound(trigger, roundCount, cfg) {
   const state = await loadState();
   const record = { ts: new Date().toISOString(), round: roundCount, trigger, outcome: "empty" };
   try {
-    const preview = await pollPreview();
-    if (!preview.claimable) {
+    const campaigns = await pollCampaigns();
+    if (!campaigns.claimable) {
       appendRound(HISTORY_FILE, record);
-      return { ...record, preview };
+      return { ...record, campaigns };
     }
-    const best = [...preview.plans].sort((a, b) => b.priority - a.priority)[0];
+    const best = [...campaigns.plans].sort((a, b) => b.priority - a.priority)[0];
     record.planId = best.planId;
     record.planName = best.name;
 
@@ -329,7 +348,7 @@ async function main() {
   log(`使用客户端版本号 ${APP_VERSION}（来源 ${resolved.source}）`);
   const mode = process.argv[2];
   if (mode === "--selftest-poll") {
-    console.log(JSON.stringify(await pollPreview(), null, 2));
+    console.log(JSON.stringify(await pollCampaigns(), null, 2));
     return;
   }
 

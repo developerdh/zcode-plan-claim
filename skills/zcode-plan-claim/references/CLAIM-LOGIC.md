@@ -1,8 +1,8 @@
 # ZCode 活动套餐领取协议
 
-> ZCode Desktop marketing-touch / billing 接口链路的协议说明，基于 3.14.4 与 3.17.1.9553 客户端验证。
+> ZCode Desktop marketing-touch / billing 接口链路的协议说明，基于客户端 3.14.4 与 3.17.1（构建 3.17.1.9553）验证。
 > 接口与凭证格式均为客户端内部实现，随时可能随客户端升级而变更；活动为平台限时投放，可领性以
-> `status` 命令综合判定（preview + current + marketing/touch 卡片三源），每个活动每账号一般限领一次。
+> `status` 命令判定（marketing/touch 活动卡片单源权威），每个活动每账号一般限领一次。
 > 仅供个人账号自动化使用，请自行评估并遵守服务条款。
 
 ## 0. 总体时序
@@ -26,7 +26,7 @@
 |---|---|---|
 | `Authorization` | `Bearer <JWT>` | 见 §2，**必须用 `zcodejwttoken`**，不是 oauth access_token |
 | `X-Device-Mid` | UUID v4 | 来自 telemetry-state.json |
-| `X-ZCode-App-Version` | 客户端完整四段构建号（如 `3.17.1.9553`） | 三段式会被服务端静默忽略（见 §6 条目 10）；脚本动态解析，`ZCODE_APP_VERSION` 四段值可硬覆盖 |
+| `X-ZCode-App-Version` | 客户端声明的版本号（app.asar 内 package.json 的 `version`，三段式如 `3.17.1`） | 营销投放按此值定向过滤（§6 条目 9/10）；exe 的 ProductVersion 构建号在客户端任何请求中都不出现 |
 | `X-Platform` | `windows` | billing 系接口使用 |
 | `X-Client-Language` | `zh-CN` | marketing 系接口使用 |
 
@@ -68,11 +68,13 @@ GET /api/v1/marketing/touch?seq=<递增整数>
   `{ plan_id, name, priority, starts_at, ends_at, entitlements:[{ show_name, grant_units, unit_type, period, effective_at }] }`
 - 账号领取套餐后，该账号的 `deliveries` 返回空数组（活动卡片不再下发）
 - ⚠️ 有频控：短时间连续请求返回 429。单轮查询只发送一次，不得高频轮询
+- ⚠️ **投放按 `X-ZCode-App-Version` 定向过滤**：仅客户端真实版本值（`3.17.1`）能收到 deliveries，
+  其他版本值返回空数组且无任何错误提示（§6 条目 10）。查询必须使用客户端声明的版本号
 - ⚠️ 活动可领时 `billing/preview` 仍可能返回空列表或缺 `data` 字段（§3.2、§6 条目 10/11）；
   `claim_zcode_plan` 按钮是客户端领取链路（§0）的入口，可领性判定以卡片为准
 - 行为上报（非必须）：`POST /api/v1/marketing/touch/action`，body `{campaign_id, action_type:"confirm"|"cancel"}`
 
-### 3.2 查询当前可领取套餐（快速旁路；权威判定用 §3.6 的 status 综合三源）
+### 3.2 查询当前可领取套餐（**脚本已下线该查询**，本节保留为协议记录）
 
 ```
 GET /api/v1/zcode-plan/billing/preview?app_version=<版本>&platform=windows
@@ -81,10 +83,11 @@ GET /api/v1/zcode-plan/billing/preview?app_version=<版本>&platform=windows
 ```
 
 - ⚠️ 只返回**当前账号尚未领取**的套餐；领过之后返回空数组（`plans:[]`），这不代表活动结束
-- ⚠️ `app_version` 仅认可完整四段构建号（如 `3.17.1.9553`）：三段式或过期版本号返回 `code:0` 但
-  **整体缺 `data` 字段**——不是报错也不是空列表（§6 条目 10）
+- ⚠️ `data` 信封仅对部分版本值返回（如四段 `3.17.1.9553` 返回、三段 `3.17.1` 缺 data，见 §6 条目 10）——
+  但卡片类活动套餐**不出现在 preview 的 plans 中**（仅经 marketing/touch 卡片下发），
+  因此 preview 的 plans 空不能判定无可领。该接口对活动判定无价值，脚本已停止调用
 
-### 3.3 查询已生效套餐（验证到账）
+### 3.3 查询已生效套餐（验证到账；对应命令 `claim.mjs active`）
 
 ```
 GET /api/v1/zcode-plan/billing/current
@@ -92,7 +95,8 @@ GET /api/v1/zcode-plan/billing/current
 ```
 
 - `ends_at` 为额度失效时间（限时活动通常为当日 24:00，本地时区）
-- 套餐 entitlement 可带未来 `effective_at`：领取成功但 `current` 在生效时刻前不显示（§6 条目 13）
+- 套餐 entitlement 可带未来 `effective_at`：领取成功但 `current` 在生效时刻前不显示（§6 条目 13）；
+  无生效套餐时服务端可能整体省略 `data` 字段
 
 ### 3.4 验证码配置（仅诊断）
 
@@ -120,28 +124,26 @@ Body: {"plan_id":"<planId>"}
 成功 → { code:0, data:{ plan:{ user_plan_id, plan_id, status:"active", ... }, message:"Plan claimed successfully." } }
 ```
 
-### 3.6 本地状态与一站式 status（区分"无活动"与"已领取过"）
+### 3.6 本地状态与一站式 status（查询活动状态的唯一权威入口）
 
-`node claim.mjs status` = preview + current + marketing/touch 三个只读 GET 的合并视图，并把观测到的
-套餐并入本地状态文件 `~/.zcode/zcode-plan-claim-state.json`（`ZCODE_CLAIM_STATE_FILE` 可覆盖；只存
-套餐元数据，不含任何凭证）：
+`node claim.mjs status` 以 marketing/touch 活动卡片为唯一权威判定源，current 生效列表与本地状态文件
+`~/.zcode/zcode-plan-claim-state.json`（`ZCODE_CLAIM_STATE_FILE` 可覆盖；只存套餐元数据，不含任何凭证）
+仅作辅助：
 
 - current 出现过 / claim 成功响应中的套餐 → 记 `claimedAt`（确证"已领取"），过期后仍保留
-- preview 出现过的未领套餐 → 仅记 sighting（`lastPreviewAt`）
 - marketing/touch 卡片中的 `claim_zcode_plan` 套餐 → 记 sighting（`discoveredAt`，`pending` 依赖此字段）
 - 输出 `situation` 字段：
 
 | situation | 含义 | 处置 |
 |---|---|---|
-| `claimable` | preview 有未领套餐（`recommendedPlanId` 为 priority 最大者，`recommendedSource:"preview"`） | 进入领取流程 |
-| `campaign_claimable` | preview 无可领（或异常），但服务端在下发可领取的活动卡片（`recommendedSource:"campaign"`）；与客户端"点卡片领取"同链路 | 进入领取流程 |
-| `already_claimed_active` | 无未领套餐，但已领取套餐仍在生效 | 报告生效套餐详情，结束 |
-| `claimed_expired` | 无未领、无生效，但本地有领取记录 | 报告历史，结束 |
+| `campaign_claimable` | 服务端在下发可领取的活动卡片（`recommendedPlanId` 为 priority 最大者）；与客户端"点卡片领取"同链路 | 进入领取流程 |
+| `already_claimed_active` | 无未领卡片，但已领取套餐仍在生效 | 报告生效套餐详情，结束 |
+| `claimed_expired` | 无未领卡片、无生效，但本地有领取记录 | 报告历史，结束 |
 | `none` | 各源均无记录 | 报告无活动，结束 |
 
-- preview 异常（非 0 code 或缺 data）不中断 status：降级为输出中的 `previewError` 字段，判定由其余源兜底
+- 卡片接口失败（非 0 code / 网络）→ 无法给出结论，退出码 4；current 失败不阻断结论，降级为 `activePlansError` 字段
 - 本地已确认领取过（`claimedAt` 存在）的卡片套餐不再判为 `campaign_claimable`
-- 退出码：0=查询成功（分支看 situation），4=接口失败
+- 退出码（谓词语义）：0=存在可领取活动；1=查询成功但无可领活动；4=活动卡片查询失败
 - 领取成功（claim code=0）也会把套餐写入状态文件，此后即使过期 status 仍能报告"领取过"
 
 ## 4. 验证码（阿里云 Captcha 2.0，每次领取都需要）
@@ -191,13 +193,16 @@ initAliyunCaptcha({
    完整请求规格未捕获，该接口只作诊断、不进主流程
 8. 领取成功后 `preview` 返回空数组（只列未领套餐），**不能据此断言"无活动"**；用 `status` 结合
    current 与本地状态文件区分"无活动 / 已领取生效中 / 已领取已过期"
-9. ZCode 桌面客户端会向子进程注入 `ZCODE_APP_VERSION`，为三段式格式（如 `3.17.1`）。三段式不被服务端认可
-   （条目 10），因此脚本不直接采用该注入值：四段 env 值硬覆盖，否则动态探测（见 §8）
-10. `billing/preview` 对不被认可的 `app_version`（三段式或过期版本号）返回 `code:0` 但**整体缺 `data` 字段**
-    （非报错、非空列表）。仅完整四段构建号返回正常信封。脚本动态探测已安装 exe 的 ProductVersion，
-    并在缺 data 时显式报错，不得静默按空列表处理
-11. preview 正常时也不是可领性权威来源：活动可领时 preview 仍可能为空，而 marketing/touch 卡片正常下发
-    claim 按钮，按钮 plan_id 可直接用于 claim。`status` 的 `campaign_claimable` 判定由此而来
+9. 客户端声明的版本号以 app.asar 内 package.json 的 `version` 为准（三段式，如 `3.17.1`）；全客户端
+   （marketing/touch、billing/claim、preview 查询参数）都用它。exe 的 ProductVersion 构建号
+   （如 `3.17.1.9553`）在客户端任何请求中都不出现，**不能**作为版本号来源
+10. 接口按版本值做定向过滤，且静默无提示：`marketing/touch` 仅对客户端真实版本值下发活动卡片，
+    其他版本值返回空 `deliveries`；`billing/preview` 则仅对部分版本值返回 `data` 信封
+    （四段 `3.17.1.9553` 有信封、三段 `3.17.1` 缺 data）。两个口径不一致，且都会被误读为
+    "无活动"——查询必须使用客户端声明的版本号（脚本动态读取 app.asar 包版本），缺 data 时显式报错
+11. 可领性权威来源是 marketing/touch 卡片：卡片类活动套餐不出现在 preview 的 plans 中，
+    preview 为空 ≠ 无活动。卡片按钮的 plan_id 可直接用于 claim；`status` 的 `campaign_claimable`
+    判定由此而来
 12. marketing/touch 有频控：短时间连续请求返回 429；单轮查询只发一次，勿高频轮询
 13. entitlement 可带未来 `effective_at`：claim 成功（`data.plan.status="active"`）但 `current` 在生效时刻前
     不显示该套餐。复核 current 为空 ≠ 领取失败，以 claim 响应为准
@@ -205,9 +210,9 @@ initAliyunCaptcha({
 ## 7. 调用语义与约束
 
 - 每个活动每账号一般限领一次；claim 返回 1001~1005 即为终态。注意 `preview` 为空只说明"没有未领的套餐"，
-  可能是已领取、版本口径问题或卡片单源下发——用 `status`（preview + current + 卡片 + 本地历史）综合判定，
+  可能是已领取、版本口径问题或卡片单源下发——以 `status`（活动卡片单源）的判定为准，
   不应盲目重跑或放弃报告
-- 领取是**写操作**：应先 `status` 确认可领（`claimable` 或 `campaign_claimable` 的 `recommendedPlanId`），
+- 领取是**写操作**：应先 `status` 确认可领（退出码 0，即 `campaign_claimable` 的 `recommendedPlanId`），
   再走验证码 + claim；无可领依据时不产生任何写请求
 - 重试边界：仅 3007 允许换新验证码参数重试一次；其余失败应立即终止并如实暴露原始错误，调用方不应自行探索替代路径（协议可能已随客户端升级变化，排查属于人工维护）
 - 避免高频重复调用；把验证码风控当作停止信号，而不是对抗目标
@@ -219,13 +224,13 @@ initAliyunCaptcha({
 | 环境变量 | 默认值 | 用途 |
 |---|---|---|
 | `ZCODE_API_BASE` | `https://zcode.z.ai` | 指向本地 mock（`tests/mock-claim-test.mjs` 即依赖此项） |
-| `ZCODE_APP_VERSION` | 动态解析 | **四段完整构建号**时硬覆盖（跳过探测）；其他格式（含客户端注入的三段式，条目 9/10）仅在探测不可用时采用并告警 |
+| `ZCODE_APP_VERSION` | 动态解析 | 任意合法 `x.y[.z[.w]]` 格式硬覆盖（跳过探测，测试确定性用） |
 | `ZCODE_PLATFORM` | `windows` | 请求头 `X-Platform` |
 | `ZCODE_CREDENTIALS_FILE` | `~/.zcode/v2/credentials.json` | 使用备用凭证文件 |
 | `ZCODE_TELEMETRY_FILE` | `~/.zcode/v2/telemetry-state.json` | 使用备用设备标识文件 |
 | `ZCODE_CREDENTIAL_SECRET` | fallback 派生串 | 凭证加密密钥的自定义来源（见 §2） |
 | `ZCODE_CAPTCHA_REGION` | `cn` | 请求头 `X-Aliyun-Captcha-Verify-Region` |
 
-版本号动态解析（无 `ZCODE_APP_VERSION` 四段值时）：win32 下单次 PowerShell 读取已安装 ZCode.exe 的
-`VersionInfo.ProductVersion`（优先运行中 `ZCode` 进程路径，回退 `%ProgramFiles%` / `%LOCALAPPDATA%\Programs`
-常见安装路径）；探测失败或非 Windows 回退内置值并告警。preview 缺 data 时显式报错并提示版本原因（条目 10）。
+版本号动态解析（未设置 `ZCODE_APP_VERSION` 时）：win32 下读取已安装客户端
+`resources\app.asar` 头部文件清单中 `package.json` 的 `version`（即客户端声明的三段式版本号）；
+探测失败或非 Windows 回退内置值并告警。preview 缺 data 时显式报错并提示原因（条目 10）。

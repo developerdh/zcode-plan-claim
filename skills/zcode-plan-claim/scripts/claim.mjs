@@ -4,63 +4,68 @@
 // 凭证仅在本机解密使用，除 zcode.z.ai 外不向任何第三方发送。
 //
 // 用法：
-//   node claim.mjs preview                          查询当前可领取的活动套餐
+//   node claim.mjs status                           查询活动状态（唯一权威判定：marketing/touch 活动卡片）
 //   node claim.mjs pending                          读取本地待领记录（零网络）
-//   node claim.mjs current                          查询账户已生效套餐
-//   node claim.mjs status                           一站式状态：可领/已领生效/活动卡片/本地领取历史
-//   node claim.mjs configs                          查询客户端配置（含验证码 SceneId/prefix）
+//   node claim.mjs active                           查询已生效套餐（领取后复核到账）
+//   node claim.mjs configs                          查询客户端配置（含验证码 SceneId/prefix，诊断用）
 //   node claim.mjs claim --plan <planId> --captcha-param-file <path>
 //                                                   提交领取（验证码参数由浏览器步骤产出）
 //
-// 退出码：0 成功/已领取（status/pending 成功恒为 0，分支看字段）；2 有可领套餐（preview）；
-//         3 暂无可领套餐；4 失败（含验证码失败/preview 响应异常）
+// status 退出码（谓词语义）：0=存在可领取活动（situation=campaign_claimable）；
+//         1=查询成功但无可领活动（分支看 situation：already_claimed_active/claimed_expired/none）；
+//         4=查询失败（活动卡片接口异常，无法给出结论）。JSON 全量输出，字段为机器判定的权威依据
+// 其余命令退出码：0 成功/已领取（pending 恒 0，分支看字段）；4 失败（含验证码失败）
 //
-// 版本号：ZCODE_APP_VERSION（四段完整构建号）> 动态探测已安装 ZCode.exe 的 ProductVersion
-//         > 环境变量非四段值（告警）> 内置回退值（告警）。服务端只认四段构建号，
-//         三段式（客户端注入子进程的值）会被 preview 静默忽略——见 references/CLAIM-LOGIC.md §6.10
+// 版本号：ZCODE_APP_VERSION（任意 x.y[.z[.w]]）> 动态读取已安装客户端 app.asar 内
+//         package.json 的 version（如 3.17.1）> 内置回退值（告警）。
+//         服务端按该版本值做定向过滤：marketing/touch 仅对客户端真实版本值下发活动卡片——
+//         见 references/CLAIM-LOGIC.md §6.9/§6.10/§6.11
 
 import { createHash, createDecipheriv } from "node:crypto";
-import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir, userInfo, platform } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 const BASE = process.env.ZCODE_API_BASE ?? "https://zcode.z.ai";
 const PLATFORM = process.env.ZCODE_PLATFORM ?? "windows";
 
 // ---------- 客户端版本号解析 ----------
-// 服务端口径（经客户端 3.17.1.9553 验证）：preview 只认完整四段构建号，
-// 三段式（如 ZCode 客户端向子进程注入的 "3.17.1"）与旧版本号都会被静默忽略——响应
-// code:0 但整体缺 data 字段。因此解析优先级：
-//   1) ZCODE_APP_VERSION 为四段完整构建号 → 直接采用（显式覆盖/测试钉版本，不触发探测）
-//   2) win32 动态探测已安装 ZCode.exe 的 ProductVersion（四段，如 3.17.1.9553）
-//   3) 环境变量为其他格式 → 采用并告警（仅探测不可用时才会走到）
-//   4) 内置回退值 + 告警
-const FALLBACK_APP_VERSION = "3.17.1.9553";
+// 服务端按"客户端声明的版本号"做定向过滤（口径以客户端 app.asar 内 package.json 的
+// version 为准，三段式如 3.17.1；exe 的 ProductVersion 构建号在客户端任何请求中都不出现）：
+//   - marketing/touch 仅对该版本值下发活动卡片，其他版本值返回空 deliveries 且无任何错误提示
+//   - billing/claim 接受该版本值
+//   - billing/preview 仅对部分版本值返回 data 信封，且卡片类活动套餐不出现在其 plans 中——
+//     preview 空不能判定无可领，可领性以 marketing/touch 卡片为准
+// 解析优先级：
+//   1) ZCODE_APP_VERSION（任意合法 x.y[.z[.w]] 格式，测试/人工覆盖用）
+//   2) 动态读取已安装 ZCode 客户端 app.asar 内 package.json 的 version
+//   3) 内置回退值 + 告警
+const FALLBACK_APP_VERSION = "3.17.1";
 const VERSION_RE = /^\d+\.\d+(\.\d+){0,3}$/;
-const VERSION_FULL_RE = /^\d+\.\d+\.\d+\.\d+$/;
-// 单次 PowerShell 覆盖"运行中进程路径 + 常见安装路径"，避免多次 spawn
-const WIN_DETECT_PS = [
-  "$paths=@()",
-  "try { $p = Get-Process -Name ZCode -ErrorAction Stop | Where-Object { $_.Path } | Select-Object -First 1 -ExpandProperty Path; if ($p) { $paths += $p } } catch {}",
-  '$paths += @("$env:ProgramFiles\\ZCode\\ZCode.exe", "$env:LOCALAPPDATA\\Programs\\ZCode\\ZCode.exe")',
-  "foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { Write-Output (Get-Item -LiteralPath $p).VersionInfo.ProductVersion; exit } }",
-].join("; ");
 
-const execFileP = promisify(execFile);
-
-async function detectWindowsAppVersion() {
+async function detectAsarPackageVersion() {
+  const { open } = await import("node:fs/promises");
+  let fh = null;
   try {
-    const { stdout } = await execFileP(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WIN_DETECT_PS],
-      { timeout: 8000, windowsHide: true },
-    );
-    const v = (stdout.trim().split(/\r?\n/)[0] ?? "").trim();
-    return VERSION_RE.test(v) ? v : null;
+    fh = await open("D:\\Program Files\\ZCode\\resources\\app.asar", "r");
+    // asar 头部：[u32 4][u32 pickleSize][u32 pickleSize][u32 jsonSize][json...]
+    const headBuf = Buffer.alloc(16);
+    await fh.read(headBuf, 0, 16, 0);
+    const jsonSize = headBuf.readUInt32LE(12);
+    const head = Buffer.alloc(jsonSize);
+    await fh.read(head, 0, jsonSize, 16);
+    const header = JSON.parse(head.toString("utf8"));
+    const pkgNode = header.files?.["package.json"];
+    if (!pkgNode) return null;
+    const dataBase = 16 + jsonSize;
+    const body = Buffer.alloc(pkgNode.size);
+    await fh.read(body, 0, pkgNode.size, dataBase + Number(pkgNode.offset));
+    const version = JSON.parse(body.toString("utf8")).version;
+    return VERSION_RE.test(String(version).trim()) ? String(version).trim() : null;
   } catch {
-    return null; // 探测失败不致命：回退 env 三段值或内置默认，preview 缺 data 时会显式报错
+    return null; // 探测失败不致命：回退内置值
+  } finally {
+    await fh?.close().catch(() => {});
   }
 }
 
@@ -71,19 +76,13 @@ function resolveAppVersion() {
 }
 async function doResolveAppVersion() {
   const env = process.env.ZCODE_APP_VERSION?.trim();
-  if (env && VERSION_FULL_RE.test(env)) return { version: env, source: "env" };
+  if (env && VERSION_RE.test(env)) return { version: env, source: "env" };
   if (process.platform === "win32") {
-    const detected = await detectWindowsAppVersion();
+    const detected = await detectAsarPackageVersion();
     if (detected) return { version: detected, source: "detect" };
   }
-  if (env && VERSION_RE.test(env)) {
-    console.error(
-      `[claim] 警告：ZCODE_APP_VERSION=${env} 不是四段完整构建号（客户端注入的三段式值不被服务端认可）；动态探测不可用，仍采用该值`,
-    );
-    return { version: env, source: "env-fallback" };
-  }
   console.error(
-    `[claim] 警告：未能动态获取客户端版本号，回退内置值 ${FALLBACK_APP_VERSION}（可用 ZCODE_APP_VERSION 指定完整构建号）`,
+    `[claim] 警告：未能动态获取客户端版本号，回退内置值 ${FALLBACK_APP_VERSION}（可用 ZCODE_APP_VERSION 指定）`,
   );
   return { version: FALLBACK_APP_VERSION, source: "fallback" };
 }
@@ -166,8 +165,8 @@ async function saveState(state) {
     console.error(`[claim] 警告：状态文件写入失败（领取历史不持久化）: ${e.message}`);
   }
 }
-// source: "claim"=确证已领取（来自 current 生效列表或领取成功响应）；
-//        "preview"/"campaign"=仅 sighting（发现但未确认领取）
+// source: "claim"=确证已领取（来自 active 生效列表或领取成功响应）；
+//        "campaign"=仅 sighting（卡片发现但未确认领取）
 function rememberPlan(state, plan, source) {
   const now = new Date().toISOString();
   const prev = state.plans[plan.planId] ?? {};
@@ -179,7 +178,6 @@ function rememberPlan(state, plan, source) {
     discoveredAt: prev.discoveredAt ?? now, // 首次 sighting 时间，pending 依赖此字段
     lastSeenAt: now,
     claimedAt: source === "claim" ? (prev.claimedAt ?? now) : (prev.claimedAt ?? null),
-    lastPreviewAt: source === "preview" ? now : (prev.lastPreviewAt ?? null),
   };
 }
 
@@ -251,108 +249,66 @@ function showPlan(p) {
   };
 }
 
-function formatPreviewPlan(p) {
-  return {
-    planId: p.plan_id,
-    name: p.name,
-    description: p.description,
-    priority: p.priority,
-    entitlements: (p.entitlements ?? []).map((e) => ({
-      model: e.show_name,
-      grantUnits: e.grant_units,
-      unitType: e.unit_type,
-      period: e.period,
-    })),
-  };
-}
-
-async function cmdPreview() {
-  const appVersion = await getAppVersion();
-  const { status, json } = await api(
-    `/api/v1/zcode-plan/billing/preview?app_version=${appVersion}&platform=${PLATFORM}`,
-  );
-  if (json.code !== 0) fail(`preview 失败 HTTP ${status} code=${json.code} ${json.msg ?? ""}`);
-  if (!json.data || !Array.isArray(json.data.plans)) {
-    fail(
-      `preview 响应缺 data/plans 字段（code=0）：app_version=${appVersion} 可能不被服务端认可` +
-        `（服务端仅认可完整四段构建号，三段式会被静默忽略）。` +
-        `可设置 ZCODE_APP_VERSION=<完整构建号> 后重试，或改用 status 命令查看 marketing/touch 活动卡片`,
-    );
-  }
-  const plans = json.data.plans.map(formatPreviewPlan);
-  console.log(JSON.stringify({ claimable: plans.length > 0, plans }, null, 2));
-  process.exit(plans.length > 0 ? 2 : 3);
-}
-
-async function cmdCurrent() {
+// 查询已生效套餐（领取后复核到账）：无生效套餐时服务端可能整体省略 data 字段
+async function cmdActive() {
   const { status, json } = await api(`/api/v1/zcode-plan/billing/current`);
-  if (json.code !== 0) fail(`current 失败 HTTP ${status} code=${json.code} ${json.msg ?? ""}`);
+  if (json.code !== 0) fail(`active 失败 HTTP ${status} code=${json.code} ${json.msg ?? ""}`);
+  const plans = (json.data?.plans ?? []).map(showPlan);
   console.log(
-    JSON.stringify({ serverTime: json.data?.server_time, plans: (json.data?.plans ?? []).map(showPlan) }, null, 2),
+    JSON.stringify(
+      {
+        serverTime: json.data?.server_time,
+        plans,
+        ...(!json.data ? { note: "当前无生效套餐（服务端省略 data 字段）" } : {}),
+      },
+      null,
+      2,
+    ),
   );
 }
 
-// 一站式状态查询（只读）：preview（未领可领）+ current（已领生效）+ marketing/touch（活动卡片），
-// 并入本地状态文件后给出无歧义结论——preview 为空时能区分"无活动"与"已领取过"。
-// 卡片判定：preview 受 app_version 口径影响可能静默忽略活动（缺 data 或空列表），
-// 而服务端仍通过 touch 下发可领取的活动卡片（客户端真实链路即 touch→claim）。
-// 因此卡片中的 claim_zcode_plan 按钮在 preview 无可领时作为权威兜底（situation=campaign_claimable）。
+// 一站式活动状态查询（只读）：以 marketing/touch 活动卡片为唯一权威判定源
+// （卡片活动不出现在 preview，生效前不出现在 current；见 references/CLAIM-LOGIC.md §6.11），
+// current 生效列表与本地状态仅作辅助（已领取确证、生效展示）。
+// 退出码（谓词语义）：0=存在可领取活动（situation=campaign_claimable）；
+// 1=查询成功但无可领活动（already_claimed_active/claimed_expired/none）；4=活动卡片查询失败
 async function cmdStatus() {
   const state = await loadState();
-  const appVersion = await getAppVersion();
 
-  // preview：异常降级为 previewError 字段，不中断 status（卡片判定可兜底）
-  let claimablePlans = [];
-  let previewError = "";
-  {
-    const pv = await api(`/api/v1/zcode-plan/billing/preview?app_version=${appVersion}&platform=${PLATFORM}`);
-    if (pv.json.code !== 0) {
-      previewError = `HTTP ${pv.status} code=${pv.json.code} ${pv.json.msg ?? ""}`;
-    } else if (!pv.json.data || !Array.isArray(pv.json.data.plans)) {
-      previewError = `响应缺 data/plans 字段——app_version=${appVersion} 可能不被服务端认可（可用 ZCODE_APP_VERSION 指定完整构建号）`;
-    } else {
-      claimablePlans = pv.json.data.plans.map(formatPreviewPlan);
-    }
-  }
-
-  const cu = await api(`/api/v1/zcode-plan/billing/current`);
-  if (cu.json.code !== 0) fail(`status: current 失败 HTTP ${cu.status} code=${cu.json.code} ${cu.json.msg ?? ""}`);
-  const activePlans = (cu.json.data?.plans ?? []).map(showPlan);
-
-  // 活动卡片：当前下发的营销投放；其中 claim_zcode_plan 按钮是可领性的权威来源之一
+  // 权威判定源：活动卡片（失败即无法给出结论，退出码 4）
   let campaigns = [];
   let campaignClaimPlans = []; // 卡片中可发起领取的 {planId, campaignId, priority, meta}
-  let campaignsError = "";
+  let serverTimeMs;
   {
     const mt = await api(`/api/v1/marketing/touch?seq=1`, { extraHeaders: { "X-Client-Language": "zh-CN" } });
-    if (mt.json.code === 0) {
-      const deliveries = mt.json.data?.deliveries ?? [];
-      campaigns = deliveries.map((d) => ({
-        campaignId: d.campaign_id,
-        position: d.resource_position,
-        priority: d.priority,
-        buttons: (d.banner?.buttons ?? []).map((b) => ({
-          text: b.text,
-          actionType: b.action?.type,
-          planId: b.action?.args?.plan_id,
-        })),
-      }));
-      for (const d of deliveries) {
-        const meta =
-          d.banner?.background?.args?.zcode_plan ?? d.banner?.hero?.args?.zcode_plan ?? null;
-        for (const b of d.banner?.buttons ?? []) {
-          if (b.action?.type === "claim_zcode_plan" && b.action?.args?.plan_id) {
-            campaignClaimPlans.push({
-              planId: b.action.args.plan_id,
-              campaignId: d.campaign_id,
-              priority: meta?.priority ?? d.priority ?? 0,
-              meta,
-            });
-          }
+    if (mt.json.code !== 0) {
+      fail(`status: 活动卡片查询失败 HTTP ${mt.status} code=${mt.json.code} ${mt.json.msg ?? ""}`);
+    }
+    serverTimeMs = mt.json.data?.server_time;
+    const deliveries = mt.json.data?.deliveries ?? [];
+    campaigns = deliveries.map((d) => ({
+      campaignId: d.campaign_id,
+      position: d.resource_position,
+      priority: d.priority,
+      buttons: (d.banner?.buttons ?? []).map((b) => ({
+        text: b.text,
+        actionType: b.action?.type,
+        planId: b.action?.args?.plan_id,
+      })),
+    }));
+    for (const d of deliveries) {
+      const meta =
+        d.banner?.background?.args?.zcode_plan ?? d.banner?.hero?.args?.zcode_plan ?? null;
+      for (const b of d.banner?.buttons ?? []) {
+        if (b.action?.type === "claim_zcode_plan" && b.action?.args?.plan_id) {
+          campaignClaimPlans.push({
+            planId: b.action.args.plan_id,
+            campaignId: d.campaign_id,
+            priority: meta?.priority ?? d.priority ?? 0,
+            meta,
+          });
         }
       }
-    } else {
-      campaignsError = `HTTP ${mt.status} code=${mt.json.code} ${mt.json.msg ?? ""}`;
     }
   }
   // 同一 plan 出现在多张卡片时取 priority 最高；本地已确认领取过的卡片不再视为可领
@@ -365,8 +321,20 @@ async function cmdStatus() {
     (c) => !state.plans[c.planId]?.claimedAt,
   );
 
+  // 辅助信息：已生效套餐（失败不阻断结论，降级为 activePlansError；
+  // 无生效套餐时服务端整体省略 data 字段，属正常空态而非失败）
+  let activePlans = [];
+  let activePlansError = "";
+  {
+    const cu = await api(`/api/v1/zcode-plan/billing/current`);
+    if (cu.json.code !== 0) {
+      activePlansError = `HTTP ${cu.status} code=${cu.json.code} ${cu.json.msg ?? ""}`;
+    } else if (cu.json.data && Array.isArray(cu.json.data.plans)) {
+      activePlans = cu.json.data.plans.map(showPlan);
+    }
+  }
+
   for (const p of activePlans) rememberPlan(state, p, "claim");
-  for (const p of claimablePlans) rememberPlan(state, p, "preview");
   for (const c of campaignById.values()) rememberPlan(state, campaignPlanRecord(c), "campaign");
   await saveState(state);
 
@@ -377,21 +345,13 @@ async function cmdStatus() {
     .map((p) => ({ ...p, currentlyActive: activeIds.has(p.planId) }));
 
   let recommendedPlanId = null;
-  let recommendedSource = null; // "preview" | "campaign"
   let situation;
   let summary;
-  if (claimablePlans.length > 0) {
-    const best = [...claimablePlans].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))[0];
-    recommendedPlanId = best.planId;
-    recommendedSource = "preview";
-    situation = "claimable";
-    summary = `有 ${claimablePlans.length} 个可领套餐，推荐 ${best.planId}（${best.name}）`;
-  } else if (unclaimedCampaignPlans.length > 0) {
+  if (unclaimedCampaignPlans.length > 0) {
     const best = [...unclaimedCampaignPlans].sort((a, b) => b.priority - a.priority)[0];
     recommendedPlanId = best.planId;
-    recommendedSource = "campaign";
     situation = "campaign_claimable";
-    summary = `preview 未列出可领套餐，但服务端在下发可领取的活动卡片，推荐 ${best.planId}（${best.meta?.name ?? "未知名称"}）——与客户端"点卡片领取"同链路，可直接进入领取流程`;
+    summary = `服务端在下发可领取的活动卡片，推荐 ${best.planId}（${best.meta?.name ?? "未知名称"}）——与客户端"点卡片领取"同链路，可直接进入领取流程`;
   } else if (activePlans.length > 0) {
     situation = "already_claimed_active";
     summary = `无可领新活动；已领取套餐生效中：${activePlans.map((p) => p.name).join("、")}`;
@@ -402,35 +362,30 @@ async function cmdStatus() {
     situation = "none";
     summary = "当前无可领活动，本地也无领取记录";
   }
-  if (situation !== "claimable" && situation !== "campaign_claimable" && campaigns.length > 0) {
-    summary += `；有 ${campaigns.length} 张活动卡片在下发（均不可领或已领取）`;
+  if (situation !== "campaign_claimable" && campaigns.length > 0) {
+    summary += `；有 ${campaigns.length} 张活动卡片在下发（均不可领取或已领取）`;
   }
-  if (previewError) {
-    summary += `；preview 异常：${previewError}`;
+  if (activePlansError) {
+    summary += `；生效套餐查询失败：${activePlansError}`;
   }
 
   console.log(
     JSON.stringify(
       {
-        serverTime: cu.json.data?.server_time
-          ? new Date(cu.json.data.server_time * 1000).toISOString()
-          : undefined,
+        serverTime: serverTimeMs ? new Date(serverTimeMs * 1000).toISOString() : undefined,
         situation,
         summary,
         recommendedPlanId,
-        ...(recommendedSource ? { recommendedSource } : {}),
-        claimablePlans,
         activePlans,
         claimHistory,
         campaigns,
-        ...(previewError ? { previewError } : {}),
-        ...(campaignsError ? { campaignsError } : {}),
+        ...(activePlansError ? { activePlansError } : {}),
       },
       null,
       2,
     ),
   );
-  process.exit(0);
+  process.exit(unclaimedCampaignPlans.length > 0 ? 0 : 1);
 }
 
 // 验证码场景参数（SceneId/prefix）会随运营配置轮换，此命令用于人工诊断是否轮换。
@@ -514,13 +469,12 @@ async function cmdClaim(args) {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
-if (cmd === "preview") await cmdPreview();
-else if (cmd === "current") await cmdCurrent();
-else if (cmd === "status") await cmdStatus();
+if (cmd === "status") await cmdStatus();
 else if (cmd === "pending") await cmdPending();
+else if (cmd === "active") await cmdActive();
 else if (cmd === "configs") await cmdConfigs();
 else if (cmd === "claim") await cmdClaim(rest);
 else {
-  console.log("用法: node claim.mjs <preview|pending|current|status|configs|claim --plan <id> --captcha-param-file <path>>");
+  console.log("用法: node claim.mjs <status|pending|active|configs|claim --plan <id> --captcha-param-file <path>>");
   process.exit(1);
 }
