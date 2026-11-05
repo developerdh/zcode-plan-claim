@@ -128,11 +128,11 @@ MCP 工具（ZCode 会话内直接可用）：
 零依赖 CLI（Node ≥ 18）：
 
 ```bash
-node skills/zcode-plan-claim/scripts/claim.mjs status    # 一站式状态查询：可领/已领生效/领取历史（推荐）
-node skills/zcode-plan-claim/scripts/claim.mjs preview   # 查询当前可领套餐；退出码 2=有可领, 3=暂无可领
-node skills/zcode-plan-claim/scripts/claim.mjs pending   # 读取本地待领记录（零网络），供回复通知后快速定位
-node skills/zcode-plan-claim/scripts/claim.mjs current   # 查询已生效套餐（验证到账）
-node skills/zcode-plan-claim/scripts/claim.mjs claim --plan <planId> --captcha-param-file <验证码参数文件>
+node skills/zcode-plan-claim/scripts/claim.mjs status    # 查询活动状态（唯一权威判定）；退出码 0=有可领, 1=无可领, 4=失败
+node skills/zcode-plan-claim/scripts/claim.mjs pending   # 读取本地待领记录（零网络）；分支看 recommendedPlanId
+node skills/zcode-plan-claim/scripts/claim.mjs active    # 查询已生效套餐（复核到账）
+node skills/zcode-plan-claim/scripts/claim.mjs configs   # 查询客户端配置（诊断用）
+node skills/zcode-plan-claim/scripts/claim.mjs claim --plan <planId> --captcha-param-file <验证码参数文件>   # 领取
 ```
 
 - 凭证自动从本机 ZCode 客户端读取（AES-256-GCM 本地解密，明文只存在于内存中，仅发送至 `zcode.z.ai`）
