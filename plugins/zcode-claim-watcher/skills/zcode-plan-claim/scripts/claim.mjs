@@ -10,6 +10,7 @@
 //   node claim.mjs configs                          查询客户端配置（含验证码 SceneId/prefix，诊断用）
 //   node claim.mjs claim --plan <planId> --captcha-param-file <path>
 //                                                   提交领取（验证码参数由浏览器步骤产出）
+//   node claim.mjs -h|--help                        显示详细帮助（全局 bin 调用时前缀自适应为 zcode-claim）
 //
 // status 退出码（谓词语义）：0=存在可领取活动（situation=campaign_claimable）；
 //         1=查询成功但无可领活动（分支看 situation：already_claimed_active/claimed_expired/none）；
@@ -385,7 +386,7 @@ async function cmdStatus() {
       2,
     ),
   );
-  process.exit(unclaimedCampaignPlans.length > 0 ? 0 : 1);
+  process.exitCode = unclaimedCampaignPlans.length > 0 ? 0 : 1; // 设 exitCode 让事件循环排空后自然退出：fetch 的 keep-alive 句柄下强制 process.exit 在 Windows 触发 libuv 断言崩溃（0xC0000409）
 }
 
 // 验证码场景参数（SceneId/prefix）会随运营配置轮换，此命令用于人工诊断是否轮换。
@@ -460,21 +461,45 @@ async function cmdClaim(args) {
       rememberPlan(st, showPlan(json.data.plan), "claim");
       await saveState(st);
     }
-    process.exit(0);
+    process.exitCode = 0;
+    return;
   }
   // 3007=验证码失败（参数缺失/过期/已用，需取新参数重试一次）
   // 1001~1005=终态失败（如已领取），不要重试
   const terminal = [1001, 1002, 1003, 1004, 1005].includes(Number(code));
-  process.exit(terminal ? 0 : 4);
+  process.exitCode = terminal ? 0 : 4;
+}
+
+// 提示语前缀跟随实际调用方式：npm 全局 bin 的 argv[1] 落在 node_modules 下显示 zcode-claim；
+// 技能目录 / 源码直调（node claim.mjs）显示脚本形态
+const PROG = process.argv[1]?.includes("node_modules") ? "zcode-claim" : "node claim.mjs";
+
+function usage(toStderr = false) {
+  const print = toStderr ? console.error : console.log;
+  print(`ZCode 活动套餐查询与领取 CLI（技能 zcode-plan-claim 的执行器，可脱离插件独立使用；凭证仅在本机解密，除 zcode.z.ai 外不向任何第三方发送）
+
+用法: ${PROG} <命令> [选项]
+
+命令：
+  status                 查询活动状态（唯一权威判定）；退出码 0=有可领, 1=无可领, 4=失败
+  pending                读取本地待领记录（零网络）；分支看 recommendedPlanId
+  active                 查询已生效套餐（领取后复核到账）
+  configs                查询客户端配置（含验证码 SceneId/prefix，诊断用）
+  claim                  提交领取：--plan <planId> --captcha-param-file <验证码参数文件>（均必填，参数一次性）
+  -h, --help             显示本帮助
+
+领取流程（内置浏览器无感验证码、终态错误码约定）见 SKILL.md 与 references/CLAIM-LOGIC.md。`);
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
-if (cmd === "status") await cmdStatus();
+if (cmd === "--help" || cmd === "-h") usage(); // 主动求助走 stdout，exit 0
+else if (cmd === "status") await cmdStatus();
 else if (cmd === "pending") await cmdPending();
 else if (cmd === "active") await cmdActive();
 else if (cmd === "configs") await cmdConfigs();
 else if (cmd === "claim") await cmdClaim(rest);
 else {
-  console.log("用法: node claim.mjs <status|pending|active|configs|claim --plan <id> --captcha-param-file <path>>");
-  process.exit(1);
+  usage(true); // 缺命令/未知命令走 stderr，exit 1（管道写是异步，process.exit 会丢缓冲，设 exitCode 自然退出）
+  console.error(`[claim] ${cmd === undefined ? "缺少命令" : `未知命令: ${cmd}`}`);
+  process.exitCode = 1;
 }

@@ -414,11 +414,16 @@ console.log("[15] pending（本地待领记录，优先级排序，排除已领�
 }
 
 // 场景16：未知命令 → 用法提示
-console.log("[16] 未知命令（→ 退出码1 + 用法提示）");
+console.log("[16] 未知命令（→ 退出码1 + stderr 用法提示）");
 {
   const r = await run(["preview"]); // 已下线的旧命令
   check("退出码=1", r.code === 1, `got ${r.code}`);
-  check("提示当前命令清单（不含 preview/current）", /status\|pending\|active/.test(r.stdout) && !/preview/.test(r.stdout));
+  const helpPart = r.stderr.split("\n[claim]")[0]; // 帮助主体（剥离回显的"未知命令"行）
+  check(
+    "stderr 帮助列出全部现行命令且不含已下线命令",
+    ["status", "pending", "active", "configs", "claim"].every((c) => helpPart.includes(c)) && !/preview|current/.test(helpPart),
+    r.stderr.slice(0, 200),
+  );
 }
 
 server.close();

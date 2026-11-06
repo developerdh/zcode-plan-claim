@@ -20,7 +20,7 @@ zcode plugins install zcode-claim-watcher@zcode-plan-claim
 
 - 插件零依赖，安装即纯文件拷贝；读取本机 ZCode 客户端登录凭证，需桌面端保持登录
 - 更新：`zcode plugins update zcode-claim-watcher@zcode-plan-claim`
-- 可选：安装后在会话内执行 `/install-zcwatch-cli` 注册全局 `zcwatch` 命令（非必须，仅需要在会话外手动管理 daemon 时使用，详见下文 zcwatch 一节）
+- 可选：安装后在会话内执行 `/install-zcwatch-cli` 注册全局 `zcwatch` / `zcode-claim` 命令（非必须，仅需要在会话外手动管理 daemon 时使用，详见下文 zcwatch 一节）
 
 ### 从源码安装
 
