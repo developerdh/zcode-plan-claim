@@ -124,6 +124,8 @@ Body: {"plan_id":"<planId>"}
 成功 → { code:0, data:{ plan:{ user_plan_id, plan_id, status:"active", ... }, message:"Plan claimed successfully." } }
 ```
 
+- ⚠️ `plan.starts_at` 为领取时刻，非生效时刻；生效起点为 `plan.entitlements[].effective_at`，可为未来时刻（见 §6.13）
+
 ### 3.6 本地状态与一站式 status（查询活动状态的唯一权威入口）
 
 `node claim.mjs status` 以 marketing/touch 活动卡片为唯一权威判定源，current 生效列表与本地状态文件

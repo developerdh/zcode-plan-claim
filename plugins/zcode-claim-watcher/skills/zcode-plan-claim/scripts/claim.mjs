@@ -197,6 +197,7 @@ function campaignPlanRecord(c) {
             grantUnits: e.grant_units,
             unitType: e.unit_type,
             period: e.period,
+            ...(e.effective_at ? { effectiveAt: new Date(e.effective_at * 1000).toISOString() } : {}),
           })),
         }
       : {}),
@@ -246,6 +247,9 @@ function showPlan(p) {
       grantUnits: e.grant_units,
       unitType: e.unit_type,
       period: e.period,
+      // 生效起点（可为未来时间）：claim 响应的 plan.starts_at 是领取/归属时刻而非生效时刻，
+      // 生效判定以本字段为准（§6.13 —— 生效前 current 列表不含该套餐）
+      effectiveAt: e.effective_at ? new Date(e.effective_at * 1000).toISOString() : undefined,
     })),
   };
 }

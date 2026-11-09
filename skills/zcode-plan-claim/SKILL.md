@@ -21,7 +21,7 @@ description: 领取 ZCode 活动卡片赠送的编程套餐额度（如限时 to
    - `success:true` → 领取成功，删除 `cap-param.txt`
    - `code:3007` → 回到第 2 步换新验证码参数重试一次；再失败即停
    - `code:1001~1005` → 终态（含已领取），视为完成，不重试
-4. **复核**：`node <技能目录>/scripts/claim.mjs active` 确认 `status:"active"`，向用户报告套餐名、额度、适用模型与有效期。`active` 列表为空时以领取响应为准（套餐可能带未来生效时间）
+4. **复核**：`node <技能目录>/scripts/claim.mjs active` 确认 `status:"active"`，向用户报告套餐名、额度、适用模型与有效期，有效期以 `effectiveAt` ~ `endsAt` 为准。`active` 列表为空时以领取响应为准（套餐可能带未来生效时间）
 
 ## 脚本
 
