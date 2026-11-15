@@ -34,6 +34,10 @@
 
 文件：`~/.zcode/v2/credentials.json`（Windows 即 `%USERPROFILE%\.zcode\v2\credentials.json`）
 
+凭证值有两种格式（客户端 3.18.x 起默认写 enc:v2，全文件所有条目统一同一种）：
+
+### 2.1 enc:v1（旧版，兼容保留）
+
 ```json
 { "zcodejwttoken": "enc:v1:<iv>.<tag>.<ct>", ... }
 ```
@@ -47,10 +51,36 @@
   ```
 
   例：`zcode-credential-fallback:win32:C:\Users\<用户名>:<用户名>`
+
+### 2.2 enc:v2（3.18.x 起现行；逆向自客户端 app.asar 凭证模块 createSystemCredentialCipher）
+
+```json
+{ "zcodejwttoken": "enc:v2:<source>:<fp>:<iv>.<tag>.<ct>", ... }
+```
+
+- 载荷与 v1 同构：`iv(12B) . authTag(16B) . ciphertext` 三段 base64url，算法 **AES-256-GCM**（key 32B）
+- `fp` = `sha256(key)` 的 hex 前 **24** 位（客户端 `keyFingerprint`）。解密前先校验指纹，
+  密钥拿错时明确报错而不是产出乱码
+- `<source>` 两种取值：
+  - **`os`**（本机客户端默认）：32 字节随机密钥存**系统钥匙串**——
+    service=`"ZCode Credential Encryption"`（`@napi-rs/keyring@2.1.2`），account=sha256(凭证文件绝对路径)
+    的 hex（Windows 凭据管理器 TargetName 即 `<account>.ZCode Credential Encryption`，
+    blob 为 43 字符 base64url 密钥串的 UTF-16LE）。此时凭证目录会有 pin 文件
+    `credential-source`（内容 `os\n`）；os 模式下**不走**管理密文回退。
+    脚本读取顺序：① 客户端 `resources/app.asar.unpacked/node_modules/@napi-rs/keyring-<平台三元组>/`
+    原生包（napi ABI 稳定，Node ≥18 直接加载）按 account 精确读，失败则扫描该 service 全部条目按
+    指纹挑选；② Windows 下 PowerShell `CredRead` 直读回退
+  - **`env`**（headless/服务器场景）：key = `sha256(管理密文)`，管理密文取
+    `ZCODE_CREDENTIAL_SECRET` > `ZCODE_CREDENTIAL_SECRET_FILE` 文件 >
+    `<凭证目录>/credential-secret` 兜底文件（32~4096 字节；headless 首次运行客户端
+    os 回退创建密钥时随机生成并写入该文件，mode 0600）
+- 加密端（客户端 `seal`）输出即 `enc:v2:<source>:<fp>:<seal(iv,tag,ct)>`；渲染进程经 IPC
+  "cipher bridge" 委托主进程加解密，密钥不出主进程
 - ⚠️ `billing/claim` 只认 `zcodejwttoken`。`oauth:bigmodel:access_token`（同样可解密成功、同样是 JWT 格式）
   会得到 401 空响应体。两种 token 前缀都是 `eyJ`，注意区分。
 - 设备标识：`~/.zcode/v2/telemetry-state.json` → `deviceMid`
-- 安全约束：明文 JWT 只应在本机内存中出现，仅发送给 `zcode.z.ai`；日志与输出中不得打印
+- 安全约束：明文 JWT 只应在本机内存中出现，仅发送给 `zcode.z.ai`；日志与输出中不得打印；
+  钥匙串密钥同理（脚本中指纹校验只输出布尔，密钥串本身不落日志）
 
 ## 3. 接口清单
 

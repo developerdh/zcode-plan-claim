@@ -4,10 +4,11 @@
 //  - feishu：飞书开放平台标准 API（tenant_access_token + im/v1/messages，接收者
 //    为绑定时的 open_id），字段读取带防御，未验证的渠道明确跳过不猜测
 // 任何失败都不抛出——通知不影响轮询主流程。
-import { randomInt, randomUUID, createHash, createDecipheriv } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { homedir, userInfo, platform } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { decryptZcodeCredentialValue } from "./credentials.mjs";
 
 const ILINK_PREFIX = "/ilink/bot";
 const WEIXIN_CHANNEL_VERSION = "2.0.0";
@@ -22,26 +23,6 @@ function dataDir() {
   return process.env.ZCODE_DATA_BASE_DIR ?? homedir();
 }
 
-function deriveKey() {
-  let secret;
-  try {
-    secret =
-      process.env.ZCODE_CREDENTIAL_SECRET?.trim() ||
-      `zcode-credential-fallback:${platform()}:${homedir()}:${userInfo().username}`;
-  } catch {
-    secret = `zcode-credential-fallback:${platform()}:${homedir()}:unknown`;
-  }
-  return createHash("sha256").update(secret).digest();
-}
-
-function decryptEntry(enc) {
-  if (typeof enc !== "string" || !enc.startsWith("enc:v1:")) throw new Error("凭证格式非 enc:v1");
-  const [iv, tag, ct] = enc.slice("enc:v1:".length).split(".");
-  const d = createDecipheriv("aes-256-gcm", deriveKey(), Buffer.from(iv, "base64url"));
-  d.setAuthTag(Buffer.from(tag, "base64url"));
-  return Buffer.concat([d.update(Buffer.from(ct, "base64url")), d.final()]).toString("utf8");
-}
-
 // 读取桌面 bot 运行时数据：{v2Dir, botConfig, botState, credentials}；缺失字段防御性回退
 export async function readBotRuntime({ configRoot } = {}) {
   const v2Dir = join(configRoot ?? dataDir(), ".zcode", "v2");
@@ -54,9 +35,11 @@ export async function readBotRuntime({ configRoot } = {}) {
   return { v2Dir, botConfig, botState, credentials };
 }
 
-function decryptCredential(credentials, ref) {
+// credFile：凭证文件路径（v2 os 来源按其绝对路径哈希定位钥匙串条目；来自 readBotRuntime
+// 的 runtime 恒有 v2Dir，手工构造 runtime 的测试可不传——v1 夹具用不到）
+async function decryptCredential(credentials, ref, credFile) {
   if (!ref) throw new Error("凭证引用缺失");
-  const token = decryptEntry(credentials[ref]).trim();
+  const token = (await decryptZcodeCredentialValue(credentials[ref], { credFile })).trim();
   if (!token) throw new Error("凭证解密结果为空");
   return token;
 }
@@ -76,8 +59,8 @@ export function buildWeixinSendBody({ fromUserId, toUserId, text, clientId }) {
   };
 }
 
-async function sendWeixinMessage({ bot, botState, credentials, text, fetchImpl, timeoutMs }) {
-  const token = decryptCredential(credentials, bot.credentialRef);
+async function sendWeixinMessage({ bot, botState, credentials, credFile, text, fetchImpl, timeoutMs }) {
+  const token = await decryptCredential(credentials, bot.credentialRef, credFile);
   const toUserId = readStr(botState.bots?.[bot.id], "privateRecipientId");
   if (!toUserId) throw new Error("会话未激活（bot-state 无接收者标识），暂无法推送");
   const ac = new AbortController();
@@ -154,6 +137,7 @@ async function sendFeishuMessage({ baseUrl, appId, appSecret, openId, text, fetc
 // 返回各通道结果，任何失败都不抛出——通知不影响轮询主流程。
 export async function sendBotNotification({ message, runtime, fetchImpl = fetch, timeoutMs = 15000, channels, failover = true } = {}) {
   const rt = runtime ?? (await readBotRuntime());
+  const credFile = rt.v2Dir ? join(rt.v2Dir, "credentials.json") : undefined;
   const bots = Array.isArray(rt.botConfig?.bots) ? rt.botConfig.bots.filter((b) => b && b.enabled !== false) : [];
   if (!bots.length) return [{ channel: "bot", ok: false, skipped: "未接入任何 bot 渠道" }];
 
@@ -168,13 +152,13 @@ export async function sendBotNotification({ message, runtime, fetchImpl = fetch,
     const channel = `bot(${bot.provider})`;
     try {
       if (bot.provider === "weixin") {
-        await sendWeixinMessage({ bot, botState: rt.botState, credentials: rt.credentials, text: message, fetchImpl, timeoutMs });
+        await sendWeixinMessage({ bot, botState: rt.botState, credentials: rt.credentials, credFile, text: message, fetchImpl, timeoutMs });
         return { channel, ok: true };
       }
       if (bot.provider === "feishu") {
         const openId = bot.providerUserId ?? "";
         if (!openId.startsWith("ou_")) return { channel, ok: false, skipped: "接收者标识非 open_id，暂不支持推送" };
-        const appSecret = decryptCredential(rt.credentials, bot.credentialRef);
+        const appSecret = await decryptCredential(rt.credentials, bot.credentialRef, credFile);
         await sendFeishuMessage({ baseUrl: feishuBase(), appId: bot.feishuAppId, appSecret, openId, text: message, fetchImpl, timeoutMs });
         return { channel, ok: true };
       }

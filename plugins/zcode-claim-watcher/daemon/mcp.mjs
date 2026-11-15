@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { normalizeConfig } from "./lib/config.mjs";
+import { loadZcodeJwt } from "./lib/credentials.mjs";
 import { appendRound, readRounds, summarize } from "./lib/history.mjs";
 import { sendBotNotification } from "./lib/notify.mjs";
 import { alreadyHandled, loadState, markNotified, markPlan, saveState, shouldNotify, statePath } from "./lib/state.mjs";
@@ -109,22 +110,8 @@ function log(msg) {
 // ---------- 只读查询 ----------
 async function apiGet(path, extraHeaders, { retried = false } = {}) {
   const APP_VERSION = (await getAppVersion()).version;
-  const creds = JSON.parse(readFileSync(process.env.ZCODE_CREDENTIALS_FILE ?? joinHomedir(".zcode", "v2", "credentials.json"), "utf8"));
-  const enc = creds["zcodejwttoken"];
-  if (typeof enc !== "string" || !enc.startsWith("enc:v1:")) throw new Error("credentials.json 中未找到 enc:v1 的 zcodejwttoken");
-  const { createHash, createDecipheriv } = await import("node:crypto");
-  const { platform, userInfo, homedir } = await import("node:os");
-  let secret;
-  try {
-    secret = process.env.ZCODE_CREDENTIAL_SECRET?.trim() || `zcode-credential-fallback:${platform()}:${homedir()}:${userInfo().username}`;
-  } catch {
-    secret = `zcode-credential-fallback:${platform()}:${homedir()}:unknown`;
-  }
-  const key = createHash("sha256").update(secret).digest();
-  const [iv, tag, ct] = enc.slice("enc:v1:".length).split(".");
-  const d = createDecipheriv("aes-256-gcm", key, Buffer.from(iv, "base64url"));
-  d.setAuthTag(Buffer.from(tag, "base64url"));
-  const jwt = Buffer.concat([d.update(Buffer.from(ct, "base64url")), d.final()]).toString("utf8");
+  // JWT 解密走共享模块（enc:v1 兼容 + enc:v2：os 来源读系统钥匙串，env 来源管理密文派生）
+  const jwt = await loadZcodeJwt();
   const telemetry = JSON.parse(readFileSync(process.env.ZCODE_TELEMETRY_FILE ?? joinHomedir(".zcode", "v2", "telemetry-state.json"), "utf8"));
   if (!telemetry.deviceMid) throw new Error("telemetry-state.json 中无 deviceMid");
   const res = await fetch(BASE + path, { headers: { Authorization: `Bearer ${jwt}`, "X-Device-Mid": telemetry.deviceMid, "X-ZCode-App-Version": APP_VERSION, "X-Platform": "windows", ...extraHeaders } });

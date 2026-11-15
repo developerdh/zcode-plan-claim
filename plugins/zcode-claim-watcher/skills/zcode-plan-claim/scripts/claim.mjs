@@ -2,6 +2,8 @@
 // ZCode 活动套餐查询与领取 CLI（非官方，协议逆向自 ZCode Desktop 3.14.4 的
 // marketing-touch / billing 接口链路，细节见 references/CLAIM-LOGIC.md）。
 // 凭证仅在本机解密使用，除 zcode.z.ai 外不向任何第三方发送。
+// 凭证格式覆盖 enc:v1（旧版 fallback 派生密钥）与 enc:v2（3.18.x 起新版：
+// os 来源=系统钥匙串随机密钥，env 来源=管理密文派生，详见下方凭证解密节）。
 //
 // 用法：
 //   node claim.mjs status                           查询活动状态（唯一权威判定：marketing/touch 活动卡片）
@@ -25,7 +27,8 @@
 import { createHash, createDecipheriv } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir, userInfo, platform } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { createRequire } from "node:module";
 
 const BASE = process.env.ZCODE_API_BASE ?? "https://zcode.z.ai";
 const PLATFORM = process.env.ZCODE_PLATFORM ?? "windows";
@@ -41,28 +44,55 @@ const PLATFORM = process.env.ZCODE_PLATFORM ?? "windows";
 //   1) ZCODE_APP_VERSION（任意合法 x.y[.z[.w]] 格式，测试/人工覆盖用）
 //   2) 动态读取已安装 ZCode 客户端 app.asar 内 package.json 的 version
 //   3) 内置回退值 + 告警
-const FALLBACK_APP_VERSION = "3.17.1";
+const FALLBACK_APP_VERSION = "3.18.2";
 const VERSION_RE = /^\d+\.\d+(\.\d+){0,3}$/;
+// 已安装客户端的 app.asar（版本探测与 v2 钥匙串密钥模块定位都依赖它；其他安装路径
+// 可用 ZCODE_CLIENT_ASAR 覆盖）
+const CLIENT_ASAR_PATH =
+  process.env.ZCODE_CLIENT_ASAR ?? "D:\\Program Files\\ZCode\\resources\\app.asar";
+
+// fs.read 对大缓冲区可能部分读取（Windows 实测），循环补齐；不完整视为失败
+async function readFull(fh, buf, fileOffset = 0) {
+  let done = 0;
+  while (done < buf.length) {
+    const { bytesRead } = await fh.read(buf, done, buf.length - done, fileOffset + done);
+    if (!bytesRead) break;
+    done += bytesRead;
+  }
+  if (done < buf.length) throw new Error(`读取不完整（${done}/${buf.length} 字节）`);
+}
+
+// 根 package.json 提取 version。部分客户端构建的 asar 根 package.json 少了收尾 '}'
+// （size 记录差一字节，3.18.2 实测），JSON.parse 必失败，正则兜底
+function parsePkgVersion(text) {
+  let version;
+  try {
+    version = JSON.parse(text).version;
+  } catch {
+    version = text.match(/"version"\s*:\s*"([^"]+)"/)?.[1];
+  }
+  version = String(version ?? "").trim();
+  return VERSION_RE.test(version) ? version : null;
+}
 
 async function detectAsarPackageVersion() {
   const { open } = await import("node:fs/promises");
   let fh = null;
   try {
-    fh = await open("D:\\Program Files\\ZCode\\resources\\app.asar", "r");
+    fh = await open(CLIENT_ASAR_PATH, "r");
     // asar 头部：[u32 4][u32 pickleSize][u32 pickleSize][u32 jsonSize][json...]
     const headBuf = Buffer.alloc(16);
-    await fh.read(headBuf, 0, 16, 0);
+    await readFull(fh, headBuf, 0);
     const jsonSize = headBuf.readUInt32LE(12);
     const head = Buffer.alloc(jsonSize);
-    await fh.read(head, 0, jsonSize, 16);
+    await readFull(fh, head, 16);
     const header = JSON.parse(head.toString("utf8"));
     const pkgNode = header.files?.["package.json"];
     if (!pkgNode) return null;
     const dataBase = 16 + jsonSize;
     const body = Buffer.alloc(pkgNode.size);
-    await fh.read(body, 0, pkgNode.size, dataBase + Number(pkgNode.offset));
-    const version = JSON.parse(body.toString("utf8")).version;
-    return VERSION_RE.test(String(version).trim()) ? String(version).trim() : null;
+    await readFull(fh, body, dataBase + Number(pkgNode.offset));
+    return parsePkgVersion(body.toString("utf8"));
   } catch {
     return null; // 探测失败不致命：回退内置值
   } finally {
@@ -96,8 +126,21 @@ function fail(msg, code = 4) {
   process.exit(code);
 }
 
-// credentials.json 中 enc:v1:<iv>.<tag>.<ct>（base64url）为 AES-256-GCM，
+// ---------- 凭证解密（enc:v1 / enc:v2，v2 逆向自客户端 3.18.x app.asar 凭证模块） ----------
+// enc:v1:<iv>.<tag>.<ct>（base64url）为 AES-256-GCM，
 // 密钥与应用一致的派生方式：sha256(ZCODE_CREDENTIAL_SECRET 或 fallback 字符串)
+//
+// enc:v2:<source>:<fp>:<iv>.<tag>.<ct>（base64url）同为 AES-256-GCM（iv 12B / tag 16B / key 32B）：
+//   - fp = sha256(key) 的 hex 前 24 位，解密前自校验（密钥拿错不碰密文）
+//   - source=os：32 字节随机密钥存系统钥匙串（Windows 凭据管理器 / macOS 钥匙串 /
+//     Linux Secret Service），service="ZCode Credential Encryption"、
+//     account=sha256(凭证文件绝对路径) 的 hex。读取优先级：
+//     ① 客户端自带 @napi-rs/keyring 平台原生包（napi ABI 稳定，Node ≥18 直接加载）
+//     ② 按 account 精确读 → 失败则扫描该 service 全部条目按指纹挑选（路径变更兜底）
+//     ③ Windows 下 PowerShell CredRead 直读（blob 为密钥串的 UTF-16LE）
+//   - source=env：key = sha256(管理密文)；管理密文取 ZCODE_CREDENTIAL_SECRET >
+//     ZCODE_CREDENTIAL_SECRET_FILE 文件 > <凭证目录>/credential-secret 兜底文件
+//     （headless 场景客户端 os 回退创建密钥时写的就是该文件，32~4096 字节）
 function credPath() {
   return (
     process.env.ZCODE_CREDENTIALS_FILE ?? join(homedir(), ".zcode", "v2", "credentials.json")
@@ -108,13 +151,7 @@ function telemetryPath() {
     process.env.ZCODE_TELEMETRY_FILE ?? join(homedir(), ".zcode", "v2", "telemetry-state.json")
   );
 }
-async function loadJwt() {
-  const credFile = credPath();
-  const creds = JSON.parse(await readFile(credFile, "utf8"));
-  const enc = creds["zcodejwttoken"];
-  if (typeof enc !== "string" || !enc.startsWith("enc:v1:")) {
-    fail(`credentials.json 格式变化，未找到 enc:v1 的 zcodejwttoken（ZCode 升级后需重新核对）`);
-  }
+function deriveLegacyKey() {
   let secret;
   try {
     secret =
@@ -123,15 +160,193 @@ async function loadJwt() {
   } catch {
     secret = `zcode-credential-fallback:${platform()}:${homedir()}:unknown`;
   }
-  const key = createHash("sha256").update(secret).digest();
+  return createHash("sha256").update(secret).digest();
+}
+function decryptV1(enc) {
   const [ivB64, tagB64, ctB64] = enc.slice("enc:v1:".length).split(".");
   try {
-    const d = createDecipheriv("aes-256-gcm", key, Buffer.from(ivB64, "base64url"));
+    const d = createDecipheriv("aes-256-gcm", deriveLegacyKey(), Buffer.from(ivB64, "base64url"));
     d.setAuthTag(Buffer.from(tagB64, "base64url"));
     return Buffer.concat([d.update(Buffer.from(ctB64, "base64url")), d.final()]).toString("utf8");
   } catch (e) {
     fail(`JWT 解密失败（密钥派生方式可能已变）: ${e.message}`);
   }
+}
+const CRED_V2_KEYRING_SERVICE = "ZCode Credential Encryption";
+const CRED_V2_KEY_BYTES = 32;
+function credV2Fingerprint(key) {
+  return createHash("sha256").update(key).digest("hex").slice(0, 24);
+}
+// 客户端 app.asar.unpacked 自带的 @napi-rs/keyring 平台原生包；加载失败返回 null
+function loadKeyringModule() {
+  const triples =
+    process.platform === "win32"
+      ? [`${process.platform}-${process.arch}-msvc`]
+      : process.platform === "darwin"
+        ? [`${process.platform}-${process.arch}`]
+        : process.platform === "linux"
+          ? [`${process.platform}-${process.arch}-gnu`, `${process.platform}-${process.arch}-musl`]
+          : [];
+  const base = join(dirname(CLIENT_ASAR_PATH), "app.asar.unpacked", "node_modules");
+  const req = createRequire(import.meta.url);
+  for (const t of triples) {
+    try {
+      return req(join(base, "@napi-rs", `keyring-${t}`, `keyring.${t}.node`));
+    } catch {}
+  }
+  return null;
+}
+// Windows 凭据管理器直读（客户端 keyring 同款存储：TargetName=<account>.<service>，
+// blob 为 43 字符 base64url 密钥串的 UTF-16LE）。脚本经 -EncodedCommand 传入规避引号转义
+async function readOsKeyViaPowerShell(account) {
+  const target = `${account}.${CRED_V2_KEYRING_SERVICE}`;
+  const ps = [
+    "$sig = @'",
+    "using System;",
+    "using System.Runtime.InteropServices;",
+    "public class CredMan {",
+    '  [DllImport("advapi32.dll", EntryPoint="CredReadW", CharSet=CharSet.Unicode, SetLastError=true)]',
+    "  static extern bool CredRead(string target, int type, int flags, out IntPtr credPtr);",
+    '  [DllImport("advapi32.dll")]',
+    "  static extern void CredFree(IntPtr cred);",
+    "  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]",
+    "  struct CREDENTIAL {",
+    "    public int Flags; public int Type; public string TargetName; public string Comment;",
+    "    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;",
+    "    public int CredentialBlobSize; public IntPtr CredentialBlob; public int Persist;",
+    "    public int AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName;",
+    "  }",
+    "  public static byte[] ReadBlob(string target) {",
+    "    IntPtr p = IntPtr.Zero;",
+    "    try {",
+    "      if (!CredRead(target, 1, 0, out p)) return null;",
+    "      CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));",
+    "      byte[] blob = new byte[c.CredentialBlobSize];",
+    "      Marshal.Copy(c.CredentialBlob, blob, 0, blob.Length);",
+    "      return blob;",
+    "    } finally { if (p != IntPtr.Zero) CredFree(p); }",
+    "  }",
+    "}",
+    "'@",
+    "Add-Type -TypeDefinition $sig",
+    `$b = [CredMan]::ReadBlob('${target}')`,
+    "if ($b -eq $null) { exit 2 }",
+    "[Console]::Out.Write([System.Text.Encoding]::Unicode.GetString($b))",
+  ].join("\n");
+  const { execFile } = await import("node:child_process");
+  const stdout = await new Promise((res, rej) => {
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(ps, "utf16le").toString("base64")],
+      { timeout: 20000, windowsHide: true },
+      (err, so, se) =>
+        err ? rej(new Error(`${err.message}${se ? " | " + String(se).trim() : ""}`)) : res(String(so)),
+    );
+  });
+  const key = Buffer.from(stdout.trim(), "base64url");
+  if (key.length !== CRED_V2_KEY_BYTES) {
+    throw new Error(`密钥长度异常（${key.length} 字节，期望 43 字符 base64url → 32 字节）`);
+  }
+  return key;
+}
+// v2 os 来源密钥：① 按 account 精确读 → ② 全条目按指纹扫描 → ③ Windows PowerShell 回退。
+// 全部失败返回 null（逐项原因打到 stderr，不打印密钥本身）
+async function readV2OsKey(fp) {
+  const credFile = resolve(credPath());
+  const account = createHash("sha256").update(credFile).digest("hex");
+  const reasons = [];
+  const mod = loadKeyringModule();
+  if (mod) {
+    try {
+      const pw = await new mod.AsyncEntry(CRED_V2_KEYRING_SERVICE, account).getPassword();
+      const key = Buffer.from(String(pw ?? ""), "base64url");
+      if (key.length === CRED_V2_KEY_BYTES && credV2Fingerprint(key) === fp) return key;
+      reasons.push("钥匙串条目缺失或指纹不匹配（account=" + account.slice(0, 12) + "…）");
+    } catch (e) {
+      reasons.push(`AsyncEntry 读取失败: ${e.message}`);
+    }
+    try {
+      const all = mod.findCredentials(CRED_V2_KEYRING_SERVICE) ?? [];
+      for (const it of all) {
+        const key = Buffer.from(String(it?.password ?? ""), "base64url");
+        if (key.length === CRED_V2_KEY_BYTES && credV2Fingerprint(key) === fp) return key;
+      }
+      reasons.push(`钥匙串 ${CRED_V2_KEYRING_SERVICE} 下共 ${all.length} 条，无指纹匹配项`);
+    } catch (e) {
+      reasons.push(`findCredentials 扫描失败: ${e.message}`);
+    }
+  } else {
+    reasons.push("客户端自带 @napi-rs/keyring 原生模块不可用");
+  }
+  if (process.platform === "win32") {
+    try {
+      const key = await readOsKeyViaPowerShell(account);
+      if (credV2Fingerprint(key) === fp) return key;
+      reasons.push("PowerShell 回退读到的密钥指纹不匹配");
+    } catch (e) {
+      reasons.push(`PowerShell CredRead 回退失败: ${e.message}`);
+    }
+  }
+  console.error("[claim] enc:v2:os 密钥读取失败，逐项原因：\n  - " + reasons.join("\n  - "));
+  return null;
+}
+// v2 env 来源密钥：管理密文 → sha256。口径与客户端 resolveManagedSecret 对齐（显式
+// env 变量 > 显式文件 > 凭证目录兜底文件；同时配置两种 env 来源视为不可用）
+async function readV2EnvKey(credFile) {
+  const { ZCODE_CREDENTIAL_SECRET, ZCODE_CREDENTIAL_SECRET_FILE } = process.env;
+  if (ZCODE_CREDENTIAL_SECRET && ZCODE_CREDENTIAL_SECRET_FILE) {
+    console.error("[claim] ZCODE_CREDENTIAL_SECRET 与 ZCODE_CREDENTIAL_SECRET_FILE 同时配置（客户端视为不可用）");
+    return null;
+  }
+  let secret = null;
+  if (ZCODE_CREDENTIAL_SECRET) secret = ZCODE_CREDENTIAL_SECRET;
+  else if (ZCODE_CREDENTIAL_SECRET_FILE) secret = await readFile(ZCODE_CREDENTIAL_SECRET_FILE, "utf8");
+  else {
+    try {
+      secret = await readFile(join(dirname(credFile), "credential-secret"), "utf8");
+    } catch {}
+  }
+  const size = secret == null ? -1 : Buffer.byteLength(secret, "utf8");
+  if (size < 32 || size > 4096) {
+    console.error("[claim] 未找到可用的管理密文（env 变量/文件均缺失或长度不在 32~4096 字节）");
+    return null;
+  }
+  return createHash("sha256").update(secret).digest();
+}
+async function decryptV2(enc, credFile) {
+  const parts = enc.slice("enc:v2:".length).split(":");
+  if (
+    parts.length !== 3 ||
+    !["os", "env"].includes(parts[0]) ||
+    !/^[a-f0-9]{24}$/.test(parts[1]) ||
+    !parts[2]
+  ) {
+    fail("enc:v2 凭证格式异常（期望 enc:v2:<os|env>:<24位指纹>:<iv.tag.ct>，除指纹外均 base64url）");
+  }
+  const [source, fp, payload] = parts;
+  const key = source === "os" ? await readV2OsKey(fp) : await readV2EnvKey(credFile);
+  if (!key) fail(`无法取得 enc:v2:${source} 来源密钥（逐项原因见上）`);
+  if (credV2Fingerprint(key) !== fp) {
+    fail("v2 密钥指纹不匹配（钥匙串/管理密文与该凭证不对应，可能更换过机器或凭证路径）");
+  }
+  const [ivB64, tagB64, ctB64] = payload.split(".");
+  if (!ivB64 || !tagB64 || !ctB64) fail("enc:v2 载荷异常（期望 iv.tag.ct 三段 base64url）");
+  try {
+    const d = createDecipheriv("aes-256-gcm", key, Buffer.from(ivB64, "base64url"));
+    d.setAuthTag(Buffer.from(tagB64, "base64url"));
+    return Buffer.concat([d.update(Buffer.from(ctB64, "base64url")), d.final()]).toString("utf8");
+  } catch (e) {
+    fail(`enc:v2 AES-256-GCM 解密失败: ${e.message}`);
+  }
+}
+async function loadJwt() {
+  const credFile = credPath();
+  const creds = JSON.parse(await readFile(credFile, "utf8"));
+  const enc = creds["zcodejwttoken"];
+  if (typeof enc !== "string" || !enc) fail("credentials.json 中无 zcodejwttoken");
+  if (enc.startsWith("enc:v2:")) return await decryptV2(enc, credFile);
+  if (enc.startsWith("enc:v1:")) return decryptV1(enc);
+  fail("credentials.json 凭证格式无法识别（非 enc:v1/enc:v2 前缀），需人工核对协议变更");
 }
 
 async function loadDeviceMid() {
