@@ -26,7 +26,9 @@ if (dirty.length) {
 const files = [
   "package.json",
   "plugins/zcode-claim-watcher/.zcode-plugin/plugin.json",
+  "plugins/zcode-claim-watcher/package.json", // 全局 npm 包清单（launcher 载体，/install-zcwatch-cli 安装源）
   ".claude-plugin/marketplace.json",
+  "plugins/marketplace.json", // 本地 marketplace 清单（zcode plugins update 的版本比对源）
 ];
 for (const file of files) {
   const path = join(root, file);
