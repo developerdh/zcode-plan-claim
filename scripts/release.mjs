@@ -43,5 +43,6 @@ for (const file of files) {
 
 git("add", ...files);
 git("commit", "-m", `chore: 发布 v${version}`);
-git("tag", `v${version}`);
+// 附注 tag：git push --follow-tags 只跟随附注 tag，轻量 tag 会被静默跳过导致 Release 不触发
+git("tag", "-a", `v${version}`, "-m", `Release v${version}`);
 console.log(`[release] 已 bump 到 ${version} 并打标签 v${version}；执行 git push --follow-tags 触发发布`);
