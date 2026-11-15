@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -31,18 +33,52 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          cat > release-notes.md <<'EOF'
-          ## 安装
+          ZIP="zcode-claim-watcher-${VERSION}.zip"
+          SHA=$(cut -d' ' -f1 "${ZIP}.sha256")
+          FENCE='```'
 
-          ```bash
+          # 变更列表：自上一 tag 以来的提交；首个 tag 时给出占位说明
+          PREV_TAG=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}~1" 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            {
+              echo "## 自 ${PREV_TAG} 以来的变更"
+              echo
+              git log --oneline --no-decorate "${PREV_TAG}..${GITHUB_REF_NAME}" | sed 's/^/- /'
+            } > changes.md
+          else
+            printf '## 本版本\n\n- 首个发布版本\n' > changes.md
+          fi
+
+          cat > release-notes.md <<EOF
+          非官方的 ZCode 活动套餐查询与领取工具。插件 zcode-claim-watcher 提供**活动监控**：常驻 daemon 轮询发现可领活动后，经 bot 渠道推送微信/飞书通知（只通知，不自动领取）。
+
+          > ⚠️ 个人学习用途的逆向实现，与 ZCode / 智谱官方无关，接口可能随客户端升级失效；仅限本人账号使用，风险自担。详见 [README](https://github.com/developerdh/zcode-plan-claim#readme)。
+
+          EOF
+          cat changes.md >> release-notes.md
+          echo >> release-notes.md
+          cat >> release-notes.md <<EOF
+          ## 安装 / 升级（ZCode 会话内执行）
+
+          ${FENCE}bash
           zcode plugins marketplace add developerdh/zcode-plan-claim
           zcode plugins install zcode-claim-watcher@zcode-plan-claim
-          ```
+
+          # 已安装用户升级
+          zcode plugins update zcode-claim-watcher@zcode-plan-claim
+          ${FENCE}
+
+          ## 安装包校验
+
+          下载 Assets 中的 zip 与 zip.sha256 放同一目录：
+
+          ${FENCE}bash
+          sha256sum -c ${ZIP}.sha256        # Linux / macOS
+          certutil -hashfile ${ZIP} SHA256  # Windows，与下行比对
+          # ${SHA}
+          ${FENCE}
           EOF
-          echo "$(cat release-notes.md)
-          SHA256: $(cut -d' ' -f1 zcode-claim-watcher-${VERSION}.zip.sha256)" > release-notes.md
-          gh release create "$GITHUB_REF_NAME" \
-            "zcode-claim-watcher-${VERSION}.zip" \
-            "zcode-claim-watcher-${VERSION}.zip.sha256" \
+
+          gh release create "$GITHUB_REF_NAME" "$ZIP" "${ZIP}.sha256" \
             --title "zcode-claim-watcher v${VERSION}" \
             --notes-file release-notes.md
