@@ -1,6 +1,6 @@
 {
   "name": "zcode-claim-watcher",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "ZCode 活动套餐领取监控：常驻 daemon 轮询可领活动，发现后经官方 bot 渠道推送提醒（不自动领取），并可会话内手动触发查询/领取",
   "author": { "name": "developerdh" },
   "mcpServers": {
