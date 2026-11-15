@@ -162,21 +162,25 @@ Body: {"plan_id":"<planId>"}
 `~/.zcode/zcode-plan-claim-state.json`（`ZCODE_CLAIM_STATE_FILE` 可覆盖；只存套餐元数据，不含任何凭证）
 仅作辅助：
 
-- current 出现过 / claim 成功响应中的套餐 → 记 `claimedAt`（确证"已领取"），过期后仍保留
+- current 出现过 / claim 成功响应中的套餐 → 记 `claimedAt`（确证"已领取"）
 - marketing/touch 卡片中的 `claim_zcode_plan` 套餐 → 记 sighting（`discoveredAt`，`pending` 依赖此字段）
+- 过期记录不长期保留：**每次落盘时清理 `endsAt` 已过的条目**（claim.mjs 与 daemon 的 saveState 同口径），
+  避免状态文件累积无效历史。安全性：服务端不会向已结束活动下发卡片，已领记录被清后即使异常重发卡片，
+  领取也会命中 1001~1005 终态码（视为完成、不重试）；无 `endsAt` 的记录无法判定时效，保留
 - 输出 `situation` 字段：
 
 | situation | 含义 | 处置 |
 |---|---|---|
 | `campaign_claimable` | 服务端在下发可领取的活动卡片（`recommendedPlanId` 为 priority 最大者）；与客户端"点卡片领取"同链路 | 进入领取流程 |
 | `already_claimed_active` | 无未领卡片，但已领取套餐仍在生效 | 报告生效套餐详情，结束 |
-| `claimed_expired` | 无未领卡片、无生效，但本地有领取记录 | 报告历史，结束 |
+| `claimed_expired` | 无未领卡片、无生效，但本地有领取记录（清理后典型场景：已领取但尚未到 `effectiveAt` 生效时刻） | 报告历史，结束 |
 | `none` | 各源均无记录 | 报告无活动，结束 |
 
 - 卡片接口失败（非 0 code / 网络）→ 无法给出结论，退出码 4；current 失败不阻断结论，降级为 `activePlansError` 字段
 - 本地已确认领取过（`claimedAt` 存在）的卡片套餐不再判为 `campaign_claimable`
 - 退出码（谓词语义）：0=存在可领取活动；1=查询成功但无可领活动；4=活动卡片查询失败
-- 领取成功（claim code=0）也会把套餐写入状态文件，此后即使过期 status 仍能报告"领取过"
+- 领取成功（claim code=0）会把套餐写入状态文件；套餐过期后下一次落盘即被清理，
+  status 不再报告已过期历史（`claimed_expired` 退化为"none"或仅剩未生效记录）
 
 ## 4. 验证码（阿里云 Captcha 2.0，每次领取都需要）
 
