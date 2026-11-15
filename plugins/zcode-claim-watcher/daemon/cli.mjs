@@ -4,7 +4,8 @@
 //
 // 用法：
 //   node cli.mjs serve [--keep-alive]   前台运行 daemon（默认 ZCode 不在运行则自退出；--keep-alive 供调试/CI）
-//   node cli.mjs ensure                 幂等拉起：健康即秒回；否则 detached 拉起 serve 并等其就绪（恒 exit 0，不阻塞会话）
+//   node cli.mjs ensure                 幂等拉起：健康且版本一致即秒回；版本不一致自动重启同步升级；
+//                                       否则 detached 拉起 serve 并等其就绪（恒 exit 0，不阻塞会话）
 //   node cli.mjs stop                   优雅停止（POST /shutdown，失败回退 pid 文件 kill；未在运行视为成功）
 //   node cli.mjs status                 查询 /health（daemon 是否在运行、pid、uptime、轮次）
 //   node cli.mjs check                  经 MCP 调 check_now 立即检查一轮（诊断/自动化用）
@@ -16,8 +17,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { daemonPort, probeHealth, mcpUrl, healthUrl, shutdownUrl } from "./http.mjs";
-import { pollCampaigns, log, PID_FILE } from "./mcp.mjs";
+import { daemonPort, probeHealth, probeHealthInfo, mcpUrl, healthUrl, shutdownUrl } from "./http.mjs";
+import { pollCampaigns, log, PID_FILE, pluginVersion } from "./mcp.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -26,10 +27,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 插件内 / 源码直调（node cli.mjs）显示脚本形态
 const PROG = process.argv[1]?.includes("node_modules") ? "zcwatch" : "node cli.mjs";
 
-// 幂等拉起：健康即回；否则 detached 拉起 serve 并轮询 /health 最多 ~4s；无论成败都 exit 0（不阻塞会话）
+// 幂等拉起 + 版本一致性自愈：健康且版本一致即秒回；健康但版本不一致（插件升级后旧 daemon
+// 仍在跑）先优雅停止再以当前版本重新拉起——否则旧进程会用旧代码持续轮询（协议变更类升级
+// 会整段失效，如 credentials enc:v1→v2）；否则 detached 拉起 serve 并轮询 /health 最多 ~4s。
+// 无论成败都 exit 0（不阻塞会话）
 async function ensure() {
   const port = daemonPort();
-  if (await probeHealth(port, 500)) return;
+  const myVersion = pluginVersion();
+  const running = await probeHealthInfo(port, 500);
+  if (running) {
+    if (running.version === myVersion) return;
+    console.error(`[zcwatch] daemon 版本不一致（运行 ${running.version ?? "未知"} ≠ 当前 ${myVersion}），自动重启以同步升级`);
+    await stopDaemon();
+    // 留出端口释放时间；若旧进程未被杀死仍持有端口，下方探活将一直不匹配并落到超时提示
+    await sleep(1000);
+  }
   const child = spawn(process.execPath, [SELF, "serve"], {
     detached: true,
     stdio: "ignore",
@@ -39,7 +51,12 @@ async function ensure() {
   const deadline = Date.now() + 4000;
   while (Date.now() < deadline) {
     await sleep(200);
-    if (await probeHealth(port, 300)) return;
+    const body = await probeHealthInfo(port, 300);
+    if (body && body.version === myVersion) return;
+  }
+  const leftover = await probeHealthInfo(port, 300);
+  if (leftover && leftover.version !== myVersion) {
+    console.error(`[zcwatch] 旧版本 daemon 未能停止（版本 ${leftover.version}），本轮保持现状，留待下次会话重试`);
   }
   // 拉起失败（如端口被其他程序占用）也不阻塞会话，留待下次会话重试
 }
@@ -102,7 +119,7 @@ function usage(toStderr = false) {
 
 命令：
   serve [--keep-alive]   前台运行 daemon；ZCode 未运行则自退出，--keep-alive 供调试/CI 常驻
-  ensure                 幂等拉起：健康即秒回；否则后台拉起并等就绪（恒 exit 0，不阻塞会话）
+  ensure                 幂等拉起：健康且版本一致即秒回；版本不一致自动重启同步升级（恒 exit 0）
   stop                   优雅停止：POST /shutdown，失败回退 pid 文件 kill；未在运行视为成功
   status                 查询 /health：运行状态、pid、uptime、轮询轮次；未运行 exit 1
   check                  经 daemon 的 MCP 立即检查一轮活动卡片（诊断/自动化用）

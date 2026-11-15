@@ -23,8 +23,12 @@ import { alreadyHandled, loadState, markNotified, markPlan, saveState, shouldNot
 
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
 
-// 版本号：优先读插件清单（daemon 同步副本随插件安装的场景），回退仓库根 package.json（源码直跑场景）
+// 版本号：ZCODE_PLUGIN_VERSION 硬覆盖（测试/CI 用）> 优先读插件清单（daemon 同步副本随
+// 插件安装的场景）> 回退仓库根 package.json（源码直跑场景）。ensure 的版本一致性自愈与
+// /health 汇报共用此口径
 function pluginVersion() {
+  const envV = process.env.ZCODE_PLUGIN_VERSION?.trim();
+  if (envV) return envV;
   for (const file of [join(SELF_DIR, "..", ".zcode-plugin", "plugin.json"), join(SELF_DIR, "..", "package.json")]) {
     try {
       const v = JSON.parse(readFileSync(file, "utf8")).version;

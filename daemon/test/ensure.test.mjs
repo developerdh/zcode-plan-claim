@@ -120,3 +120,38 @@ test("serve：端口被其他程序占用（/health 不健康）→ exit 1", asy
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+// 4) 版本一致性自愈：运行中的 daemon 版本 ≠ ensure 侧版本（插件升级后旧 daemon 仍在跑的
+//    场景，ZCODE_PLUGIN_VERSION 分别覆盖两侧模拟）→ 优雅停止旧实例，以 ensure 侧版本重新拉起
+test("ensure：版本不一致 → 自动重启换新（pid 变化且版本同步）", async () => {
+  const { home, pidFile } = makeHome("vermismatch");
+  const port = PORT_BASE + 10;
+  const oldDaemon = spawn(process.execPath, [CLI, "serve", "--keep-alive"], {
+    env: { ...childEnv(port, home), ZCODE_PLUGIN_VERSION: "0.0.1-old" },
+    stdio: "ignore",
+  });
+  try {
+    const oldHealth = await waitHealth(port);
+    assert.ok(oldHealth, "旧 daemon 未就绪");
+    assert.equal(oldHealth.version, "0.0.1-old", "测试前提：旧 daemon 带旧版本");
+
+    const ensure = spawnSync(process.execPath, [CLI, "ensure"], {
+      env: { ...childEnv(port, home), ZCODE_PLUGIN_VERSION: "0.0.2-new" },
+      timeout: 20000,
+      encoding: "utf8",
+    });
+    assert.equal(ensure.status, 0, `ensure 应恒 exit 0：${ensure.stderr}`);
+    assert.match(ensure.stderr, /版本不一致/, "应提示版本不一致并重启");
+
+    const fresh = await waitHealth(port, 6000);
+    assert.ok(fresh, "重启后 daemon 应就绪");
+    assert.notEqual(fresh.pid, oldDaemon.pid, "应拉起新实例而非复用旧实例");
+    assert.equal(fresh.version, "0.0.2-new", "新实例应带 ensure 侧的当前版本");
+    assert.ok(existsSync(pidFile), "pid 文件应随新实例就位");
+    await shutdown(port);
+  } finally {
+    await shutdown(port);
+    oldDaemon.kill();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
