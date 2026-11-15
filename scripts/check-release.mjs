@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// 校验三处版本号一致：package.json / plugin.json / marketplace.json（以 package.json 为基准）。
-// 传入发布版本时（如 0.2.0 或 v0.2.0）额外校验三处都与之一致。CI 与 release 流程共用。
+// 校验五处版本号一致（以 package.json 为基准）：package.json / 插件 plugin.json /
+// 远端 marketplace.json / 插件包 package.json（全局 npm 包）/ 本地 marketplace.json。
+// 传入发布版本时（如 0.2.0 或 v0.2.0）额外校验五处都与之一致。CI 与 release 流程共用。
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,9 +13,16 @@ const plugin = JSON.parse(
 );
 const marketplace = JSON.parse(readFileSync(join(root, ".claude-plugin/marketplace.json"), "utf8"));
 const entry = marketplace.plugins.find((p) => p.name === plugin.name);
+const npmPkg = JSON.parse(readFileSync(join(root, "plugins/zcode-claim-watcher/package.json"), "utf8"));
+const localMarketplace = JSON.parse(readFileSync(join(root, "plugins/marketplace.json"), "utf8"));
+const localEntry = localMarketplace.plugins.find((p) => p.name === plugin.name);
 
 if (!entry) {
   console.error(`[check] marketplace.json 中找不到插件 ${plugin.name}`);
+  process.exit(1);
+}
+if (!localEntry) {
+  console.error(`[check] plugins/marketplace.json 中找不到插件 ${plugin.name}`);
   process.exit(1);
 }
 
@@ -23,6 +31,8 @@ const sources = [
   ["package.json", pkg.version],
   ["plugins/zcode-claim-watcher/.zcode-plugin/plugin.json", plugin.version],
   [".claude-plugin/marketplace.json", entry.version],
+  ["plugins/zcode-claim-watcher/package.json", npmPkg.version],
+  ["plugins/marketplace.json", localEntry.version],
 ];
 
 let ok = true;
