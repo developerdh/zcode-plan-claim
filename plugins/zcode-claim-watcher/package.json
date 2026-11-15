@@ -1,6 +1,6 @@
 {
   "name": "zcode-claim-watcher",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "ZCode 活动套餐领取监控插件（daemon + MCP + 技能 CLI，零依赖）",
