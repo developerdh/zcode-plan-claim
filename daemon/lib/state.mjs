@@ -16,7 +16,18 @@ export async function loadState(file = statePath()) {
   return { version: 1, plans: {} };
 }
 
+// 过期记录清理（与 claim.mjs 的 saveState 同口径）：endsAt 已过的条目落盘时移除，
+// 避免状态文件长期累积无效历史。服务端不会向已结束活动下发卡片，已领记录被清后即使
+// 异常重发卡片，领取也命中 1001~1005 终态码不会重复扣量；无 endsAt 的记录无法判定时效，保留
+export function pruneExpiredPlans(state, nowMs = Date.now()) {
+  for (const [planId, p] of Object.entries(state.plans ?? {})) {
+    const ends = p?.endsAt ? Date.parse(p.endsAt) : NaN;
+    if (Number.isFinite(ends) && ends < nowMs) delete state.plans[planId];
+  }
+}
+
 export async function saveState(state, file = statePath()) {
+  pruneExpiredPlans(state);
   try {
     await writeFile(file, JSON.stringify(state, null, 2) + "\n");
     return true;

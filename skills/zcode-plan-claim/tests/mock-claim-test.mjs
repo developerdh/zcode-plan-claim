@@ -51,7 +51,7 @@ const FIXTURES = {
       plan: {
         user_plan_id: "upl_2106545324661809152", plan_id: "zcode-v3-start-plan-trust-1004",
         name: "ZCode Trust Build", description: "ZCode Global Build", priority: 110,
-        status: "active", starts_at: 1791074517, ends_at: 1791129600,
+        status: "active", starts_at: 1791074517, ends_at: Math.floor(Date.now() / 1000) + 86400, // 有效期内：过期记录会被 saveState 清理，跨场景断言依赖该记录存续
         entitlements: [{
           entitlement_id: "zcode-v3-start-plan-trust-1004", show_name: "GLM-5.3-Flash",
           meter: "model_usage", unit_type: "token", capabilities: ["model:glm-5.3-flash"],
@@ -80,7 +80,7 @@ const FIXTURES = {
       plans: [{
         user_plan_id: "upl_2106545324661809152", plan_id: "zcode-v3-start-plan-trust-1004",
         name: "ZCode Trust Build", description: "ZCode Global Build", priority: 110,
-        status: "active", starts_at: 1791074517, ends_at: 1791129600,
+        status: "active", starts_at: 1791074517, ends_at: Math.floor(Date.now() / 1000) + 86400, // 有效期内：过期记录会被 saveState 清理，跨场景断言依赖该记录存续
         entitlements: [{
           entitlement_id: "zcode-v3-start-plan-trust-1004", show_name: "GLM-5.3-Flash",
           meter: "model_usage", unit_type: "token", capabilities: ["model:glm-5.3-flash"],
