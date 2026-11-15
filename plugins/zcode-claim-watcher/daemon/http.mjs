@@ -28,15 +28,21 @@ export function shutdownUrl(port = daemonPort()) {
   return `http://${DAEMON_HOST}:${port}/shutdown`;
 }
 
-// 探测 /health：可达且 body.ok === true 才视为健康（区分"我们的 daemon"与"端口被其他程序占用"）
-export async function probeHealth(port = daemonPort(), timeoutMs = 800) {
+// 探活并返回 /health 完整信息（ensure 做版本一致性比对用）；不可达/不健康返回 null
+export async function probeHealthInfo(port = daemonPort(), timeoutMs = 800) {
   try {
     const res = await fetch(healthUrl(port), { signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return false;
-    return JSON.parse(await res.text()).ok === true;
+    if (!res.ok) return null;
+    const body = JSON.parse(await res.text());
+    return body?.ok === true ? body : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// 探测 /health：可达且 body.ok === true 才视为健康（区分"我们的 daemon"与"端口被其他程序占用"）
+export async function probeHealth(port = daemonPort(), timeoutMs = 800) {
+  return (await probeHealthInfo(port, timeoutMs)) !== null;
 }
 
 const MAX_BODY = 1024 * 1024;

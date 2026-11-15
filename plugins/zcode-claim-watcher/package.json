@@ -5,7 +5,7 @@
   "type": "module",
   "description": "ZCode 活动套餐领取监控插件（daemon + MCP + 技能 CLI，零依赖）",
   "bin": {
-    "zcwatch": "daemon/cli.mjs",
-    "zcode-claim": "skills/zcode-plan-claim/scripts/claim.mjs"
+    "zcwatch": "bin/zcwatch.mjs",
+    "zcode-claim": "bin/zcode-claim.mjs"
   }
 }
